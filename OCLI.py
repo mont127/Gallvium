@@ -105,12 +105,7 @@ def print_diff(diff_lines):
         else: print(f"    {Colors.GRAY}{line.rstrip()}{Colors.RESET}")
     print()
 
-class Colors:
-    CYAN = "\033[96m"
-    BLUE = "\033[94m"
-    GRAY = "\033[90m"
-    BOLD = "\033[1m"
-    RESET = "\033[0m"
+
 
 def print_logo():
     logo = rf"""{Colors.CYAN}{Colors.BOLD}
