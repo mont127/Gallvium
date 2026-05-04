@@ -105,29 +105,46 @@ def print_diff(diff_lines):
         else: print(f"    {Colors.GRAY}{line.rstrip()}{Colors.RESET}")
     print()
 
+class Colors:
+    CYAN = "\033[96m"
+    BLUE = "\033[94m"
+    GRAY = "\033[90m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
 def print_logo():
-    logo = rf"""
-{Colors.CYAN}{Colors.BOLD}
+    logo = rf"""{Colors.CYAN}{Colors.BOLD}
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-                        7PP?.          .?PP7
-                       P@PY@B:        :B@YP@P
-                      !@#  5@5.!?JJ?!.5@5  #@!
-                      J@P  7@@&BP55PB&@@7  P@J
-  ___  _ _            7@&PP#@5^      ^5@#PP&@7           _ __ ___   __ _ 
- / _ \| | |         .J&#5?!!~          ~!!?5#&J.        | '_ ` _ \ / _` |
-| | | | | |-------- .B@Y.                    .Y@B.------| | | | | | (_| |
-| |_| | | |        Y@P   .^.   ^~!!~^   .^.   P@Y       |_| |_| |_|\__,_|
- \___/|_|_|        Y@5   G@G.JG5J??J5GJ.G@G   5@Y
-                   :B@J. :~:BB: :YY. :BB:~: .J@B:
-                    5@B:    GB^  ?7  ^BG    :B@5
-                   ~@&.     .?PP5YY5PP?.     .&@~
-                   ?@G         .::::.         G@?
-                   ^@&^                      ^&@^
-                    ?@&^                    ^&@?
-                    Y@G.                    .G@Y
-                   :&@^                      ^@&:
-                   :&@^                      ^@&:
+   ___  _      ____          _     
+  / _ \| |    / ___|___   __| | __
+ | | | | |   | |   / _ \ / _` |/ _ \ 
+ | |_| | |___| |__| (_) | (_| |  __/
+  \___/|_____|\____\___/ \__,_|\___/
+
+{Colors.GRAY}      Free Open Source AI Coding Assistant
+      Local models - Tools - Shell - Files - Web{Colors.CYAN}
+
+                              7PP?.          .?PP7
+                             P@PY@B:        :B@YP@P
+                            !@#  5@5.!?JJ?!.5@5  #@!
+                            J@P  7@@&BP55PB&@@7  P@J
+                            7@&PP#@5^      ^5@#PP&@7
+                           .J&#5?!!~          ~!!?5#&J.
+                           .B@Y.                    .Y@B.
+                           Y@P   .^.   ^~!!~^   .^.   P@Y
+                           Y@5   G@G.JG5J??J5GJ.G@G   5@Y
+                           :B@J. :~:BB: :YY. :BB:~: .J@B:
+                            5@B:    GB^  ?7  ^BG    :B@5
+                           ~@&.     .?PP5YY5PP?.     .&@~
+                           ?@G         .::::.         G@?
+                           ^@&^                      ^&@^
+                            ?@&^                    ^&@?
+                            Y@G.                    .G@Y
+                           :&@^                      ^@&:
+                           :&@^                      ^@&:
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+{Colors.RESET}"""
+    print(logo)
 {Colors.RESET}{Colors.GRAY}
          >>> OllamaCode- Free Open Source AI Coding Assistant <<<{Colors.RESET}
 """
