@@ -145,7 +145,7 @@ def print_logo():
 """
     print(logo)
 
-MAX_OUTPUT_LENGTH = 5000
+MAX_OUTPUT_LENGTH = 20000
 HISTORY_THRESHOLD = 40
 DANGEROUS_PATTERNS = [r'\brm\b', r'\bmv\b', r'\bsudo\b', r'\bchmod\b', r'\bchown\b', r'\bdd\b', r'\bmkfs\b', r'\bformat\b', r'\bkill\b', r'>\s*/dev/', r'\bshred\b', r'\bwipe\b']
 ALLOWED_SEARCH_DOMAINS = ["ollama.com", "googleblog.com", "ai.google.dev", "huggingface.co"]
