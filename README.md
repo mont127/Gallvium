@@ -1,4 +1,4 @@
-# OLCodeZ
+# OLCode
 
 An advanced agentic AI coding assistant designed for autonomous system-level operations.
 
