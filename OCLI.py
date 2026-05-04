@@ -138,11 +138,9 @@ def print_logo():
                            :&@^                      ^@&:
                            :&@^                      ^@&:
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-{Colors.RESET}"""
-    print(logo)
 {Colors.RESET}{Colors.GRAY}
-         >>> OllamaCode- Free Open Source AI Coding Assistant <<<{Colors.RESET}
-"""
+         >>> OllamaCode- Free Open Source AI Coding Assistant <<<
+{Colors.RESET}"""
     print(logo)
 
 MAX_OUTPUT_LENGTH = 20000
