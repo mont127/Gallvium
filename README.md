@@ -6,6 +6,29 @@
  | |_| | |___| |__| (_) | (_| |  __/
   \___/|_____|\____\___/ \__,_|\___/
 
+Free Open Source AI Coding Assistant
+      Local models - Tools - Shell - Files - Web{Colors.CYAN}
+
+                              7PP?.          .?PP7
+                             P@PY@B:        :B@YP@P
+                            !@#  5@5.!?JJ?!.5@5  #@!
+                            J@P  7@@&BP55PB&@@7  P@J
+                            7@&PP#@5^      ^5@#PP&@7
+                           .J&#5?!!~          ~!!?5#&J.
+                           .B@Y.                    .Y@B.
+                           Y@P   .^.   ^~!!~^   .^.   P@Y
+                           Y@5   G@G.JG5J??J5GJ.G@G   5@Y
+                           :B@J. :~:BB: :YY. :BB:~: .J@B:
+                            5@B:    GB^  ?7  ^BG    :B@5
+                           ~@&.     .?PP5YY5PP?.     .&@~
+                           ?@G         .::::.         G@?
+                           ^@&^                      ^&@^
+                            ?@&^                    ^&@?
+                            Y@G.                    .G@Y
+                           :&@^                      ^@&:
+                           :&@^                      ^@&:
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
 An advanced agentic AI coding assistant designed for autonomous system-level operations.
 
 ## Features
