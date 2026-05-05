@@ -13,6 +13,7 @@ import termios
 import tty
 import warnings
 import datetime
+import requests
 try:
     from ddgs import DDGS
 except ImportError:
@@ -58,6 +59,31 @@ def log_tool(msg):
 
 def log_info(msg):
     print(f"  {Colors.YELLOW}[INFO] {msg}{Colors.RESET}")
+
+class Spinner:
+    def __init__(self, msg="AI is thinking"):
+        self.msg = msg
+        self.running = False
+        self.thread = None
+        self.frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def _spin(self):
+        i = 0
+        while self.running:
+            print(f"  {Colors.CYAN}{self.frames[i % len(self.frames)]} {self.msg}{Colors.RESET}", end="\r")
+            time.sleep(0.1)
+            i += 1
+        sys.stdout.write("\r" + " " * (len(self.msg) + 10) + "\r")
+        sys.stdout.flush()
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._spin, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread: self.thread.join()
 
 class InterruptionManager:
     def __init__(self):
@@ -105,8 +131,6 @@ def print_diff(diff_lines):
         else: print(f"    {Colors.GRAY}{line.rstrip()}{Colors.RESET}")
     print()
 
-
-
 def print_logo():
     logo = rf"""{Colors.CYAN}{Colors.BOLD}
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -143,8 +167,8 @@ def print_logo():
 {Colors.RESET}"""
     print(logo)
 
-MAX_OUTPUT_LENGTH = 20000
-HISTORY_THRESHOLD = 40
+MAX_OUTPUT_LENGTH = 5000
+HISTORY_THRESHOLD = 20
 DANGEROUS_PATTERNS = [r'\brm\b', r'\bmv\b', r'\bsudo\b', r'\bchmod\b', r'\bchown\b', r'\bdd\b', r'\bmkfs\b', r'\bformat\b', r'\bkill\b', r'>\s*/dev/', r'\bshred\b', r'\bwipe\b']
 ALLOWED_SEARCH_DOMAINS = ["ollama.com", "googleblog.com", "ai.google.dev", "huggingface.co"]
 
@@ -171,11 +195,17 @@ def truncate_output(output):
     return str(output)
 
 class OCLI:
-    def __init__(self, model_name, auto_mode=False):
+    def __init__(self, model_name, auto_mode=False, backend='ollama', url=None):
         self.model_name = model_name
         self.auto_mode = auto_mode
+        self.backend = backend
+        self.url = url or ("http://localhost:11434" if backend == 'ollama' else "http://localhost:8080")
+        self.planning_enabled = False
+        self.tasks = []
+        self.active_process = None
+        self.PLAN_PROMPT = "Before performing complex tasks, multiple file edits, or potentially destructive operations, you MUST create an implementation plan using the 'create_plan' tool. Break the plan down into discrete, numbered tasks. As you work, use the 'update_task' tool to mark tasks as 'doing' and 'done'. This provides the user with checkpoints."
         cur_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.messages = [{'role': 'system', 'content': f"You are OCLI, an advanced AI agent. Current date: {cur_date}. Wrap internal reasoning in <thought> tags. End multi-step tasks with 'CONTINUE'. When the user asks for multiple searches, perform at least 5 search before summarizing. Prefer specific article pages over generic news index pages. Clearly separate confirmed facts from broader interpretation."}]
+        self.messages = [{'role': 'system', 'content': f"You are OCLI, an advanced AI agent. Current date: {cur_date}. Wrap internal reasoning in <thought> tags. End multi-step tasks with 'CONTINUE'. Planning is DISABLED by default. Use '/plan' to enable it if needed. CRITICAL: Use the 'test_cmd' tool for ANY command that might be interactive (games, prompts, servers). DO NOT use 'run_cmd' for these. MANDATORY: Always use 'write_file' for all code modifications to ensure the user sees a diff report. DO NOT use 'sed', 'awk', or 'echo' for file edits. When the user asks for multiple searches, perform at least 5 search before summarizing."}]
 
     def run_cmd(self, command):
         try:
@@ -199,22 +229,109 @@ class OCLI:
             process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             output = []
             print(f"\n  {Colors.MAGENTA}{Colors.BOLD}[EXEC_OUTPUT]{Colors.RESET}")
+            last_out = time.time()
             while True:
                 if interrupter.interrupted.is_set():
                     process.terminate()
                     print(f"\n  {Colors.RED}[INTERRUPTED]{Colors.RESET}")
                     interrupter.stop_listening()
                     return "Command interrupted."
-                line = process.stdout.readline()
-                if not line and process.poll() is not None: break
-                if line:
-                    print(line, end="")
-                    output.append(line)
+                
+                rlist, _, _ = select.select([process.stdout], [], [], 1.0)
+                if rlist:
+                    line = process.stdout.readline()
+                    if line:
+                        print(line, end="")
+                        output.append(line)
+                        last_out = time.time()
+                        continue
+                
+                if process.poll() is not None: break
+                
+                
+                if time.time() - last_out > 60:
+                    process.terminate()
+                    interrupter.stop_listening()
+                    return f"Command Timed Out (60s silence). If this was interactive, use 'test_cmd'. Output so far:\n" + "".join(output)
+
             interrupter.stop_listening()
             return f"Command Output:\n" + "".join(output)
         except Exception as e:
             interrupter.stop_listening()
             return f"Command Failed: {str(e)}"
+
+    def test_cmd(self, command):
+        try:
+            if self.active_process and self.active_process.poll() is None:
+                self.active_process.terminate()
+            
+            log_tool(f"TEST_EXEC: {command}")
+            interrupter.start_listening()
+            self.active_process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.PIPE, text=True, bufsize=1)
+            output = []
+            print(f"\n  {Colors.MAGENTA}{Colors.BOLD}[TEST_EXEC_OUTPUT]{Colors.RESET}")
+            
+            last_output_time = time.time()
+            while True:
+                if interrupter.interrupted.is_set():
+                    self.active_process.terminate()
+                    print(f"\n  {Colors.RED}[INTERRUPTED]{Colors.RESET}")
+                    interrupter.stop_listening()
+                    return "Test interrupted."
+                
+                rlist, _, _ = select.select([self.active_process.stdout], [], [], 0.5)
+                
+                if rlist:
+                    line = self.active_process.stdout.readline()
+                    if line:
+                        print(line, end="")
+                        output.append(line)
+                        last_output_time = time.time()
+                        continue
+                
+                if self.active_process.poll() is not None: break
+                
+               
+                if time.time() - last_output_time > 5:
+                    print(f"\n  {Colors.YELLOW}[LIVE_FEEDBACK] No output for 5s. Waiting for AI input...{Colors.RESET}")
+                    interrupter.stop_listening()
+                    buffer = "".join(output[-200:])
+                    return f"LIVE_FEEDBACK (Process waiting for input):\n{buffer}\nUse 'send_input' to interact."
+                    
+            interrupter.stop_listening()
+            return f"Test Completed. Output:\n" + "".join(output)
+        except Exception as e:
+            interrupter.stop_listening()
+            return f"Test Failed: {str(e)}"
+
+    def send_input(self, text):
+        try:
+            if not self.active_process or self.active_process.poll() is not None:
+                return "Error: No active process to send input to."
+            
+            log_info(f"Sending Input: {text}")
+            self.active_process.stdin.write(text + "\n")
+            self.active_process.stdin.flush()
+            
+            output = []
+            last_output_time = time.time()
+            interrupter.start_listening()
+            while True:
+                if interrupter.interrupted.is_set(): break
+                rlist, _, _ = select.select([self.active_process.stdout], [], [], 0.5)
+                if rlist:
+                    line = self.active_process.stdout.readline()
+                    if line:
+                        print(line, end="")
+                        output.append(line)
+                        last_output_time = time.time()
+                        continue
+                if self.active_process.poll() is not None: break
+                if time.time() - last_output_time > 5: break
+                
+            interrupter.stop_listening()
+            return f"Input sent. New Output:\n" + "".join(output)
+        except Exception as e: return f"Error: {str(e)}"
 
     def web_search(self, query):
         try:
@@ -268,22 +385,95 @@ class OCLI:
             return f"File created."
         except Exception as e: return f"Error: {str(e)}"
 
+    def print_tasks(self):
+        if not self.tasks: return
+        print(f"\n  {Colors.CYAN}{Colors.BOLD}[PROGRESS_CHECKPOINTS]{Colors.RESET}")
+        for i, task in enumerate(self.tasks):
+            icon = f"{Colors.GRAY}[ ]"
+            if task['status'] == 'done': icon = f"{Colors.GREEN}[x]"
+            elif task['status'] == 'doing': icon = f"{Colors.YELLOW}[/]"
+            print(f"    {icon} {Colors.RESET}{i+1}. {task['text']}")
+        print()
+
+    def create_plan(self, plan):
+        try:
+            self.tasks = []
+            
+            lines = plan.split('\n')
+            for line in lines:
+                match = re.match(r'^\s*[\*\-\d\.]+\s*(.*)', line)
+                if match and match.group(1).strip():
+                    self.tasks.append({'text': match.group(1).strip(), 'status': 'todo'})
+            
+            print(f"\n  {Colors.GREEN}{Colors.BOLD}[IMPLEMENTATION_PLAN]{Colors.RESET}")
+            print(render_text(plan))
+            self.print_tasks()
+            print(f"  {Colors.YELLOW}{Colors.BOLD}Awaiting your approval or feedback to proceed...{Colors.RESET}")
+            feedback = input(f"  {Colors.BOLD}Feedback (Enter to approve):{Colors.RESET} ").strip()
+            if not feedback:
+                return "Plan approved. Start by marking the first task as 'doing' using update_task."
+            return f"User feedback: {feedback}. Adjust the plan or address it."
+        except Exception as e: return f"Error: {str(e)}"
+
+    def update_task(self, index, status):
+        try:
+            idx = int(index) - 1
+            if 0 <= idx < len(self.tasks):
+                self.tasks[idx]['status'] = status
+                self.print_tasks()
+                return f"Task {index} updated to {status}."
+            return f"Invalid task index: {index}"
+        except Exception as e: return f"Error: {str(e)}"
+
+    def save_session(self, path=None):
+        try:
+            if not path:
+                path = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(path, 'w') as f:
+                json.dump(self.messages, f, indent=2)
+            log_info(f"Session saved to {path}")
+            return f"Session saved to {path}"
+        except Exception as e: return f"Error saving session: {str(e)}"
+
+    def load_session(self, path):
+        try:
+            if not os.path.exists(path):
+                return f"File not found: {path}"
+            with open(path, 'r') as f:
+                self.messages = json.load(f)
+            log_info(f"Session loaded from {path}")
+            return f"Session loaded from {path}"
+        except Exception as e: return f"Error loading session: {str(e)}"
+
     def display_metrics(self, response):
-        duration = response.get('total_duration', 0) / 1e9
-        p_tokens = response.get('prompt_eval_count', 0)
-        e_tokens = response.get('eval_count', 0)
-        if duration > 0: print(f"{Colors.GRAY}[STATS] {duration:.2f}s | IN: {p_tokens} | OUT: {e_tokens}{Colors.RESET}")
+        if self.backend == 'ollama':
+            duration = response.get('total_duration', 0) / 1e9
+            p_tokens = response.get('prompt_eval_count', 0)
+            e_tokens = response.get('eval_count', 0)
+            if duration > 0: print(f"{Colors.GRAY}[STATS] {duration:.2f}s | IN: {p_tokens} | OUT: {e_tokens}{Colors.RESET}")
+        else:
+            
+            print(f"{Colors.GRAY}[STATS] Request Completed.{Colors.RESET}")
 
     def compact_history(self):
         if len(self.messages) > HISTORY_THRESHOLD:
-            log_info("Compacting...")
+            log_info("History threshold reached. Compacting...")
             system_msg = self.messages[0]
-            recent_context = self.messages[-10:]
+            recent_context = self.messages[-8:]
+            middle_messages = self.messages[1:-8]
             try:
-                middle_messages = self.messages[1:-10]
-                response = ollama.chat(model=self.model_name, messages=middle_messages + [{'role': 'user', 'content': "Summarize context concisely."}])
-                self.messages = [system_msg, {'role': 'assistant', 'content': f"Summary: {response['message']['content']}"}] + recent_context
-            except: self.messages = [system_msg] + recent_context
+                prompt = "Summarize the key progress and facts from this conversation in 3 sentences max. Focus on what was built and what bugs were fixed."
+                if self.backend == 'ollama':
+                    summary_resp = ollama.chat(model=self.model_name, messages=middle_messages + [{'role': 'user', 'content': prompt}])
+                    summary = summary_resp['message']['content']
+                else:
+                    r = requests.post(f"{self.url}/v1/chat/completions", json={"model": self.model_name, "messages": middle_messages + [{'role': 'user', 'content': prompt}]})
+                    summary = r.json()['choices'][0]['message']['content']
+                self.messages = [system_msg, {'role': 'assistant', 'content': f"Summary of previous progress: {summary}"}] + recent_context
+                log_info("Compaction successful.")
+            except Exception as e:
+                log_info(f"Compaction failed ({e}). Truncating history.")
+                self.messages = [system_msg] + recent_context
 
     def run(self):
         print_logo()
@@ -296,8 +486,62 @@ class OCLI:
                 user_input = input(f"\n{Colors.YELLOW}{Colors.BOLD}[VibeCoder] > {Colors.RESET}").strip()
                 print("")
                 print("-" * 200)
+                if not user_input: continue
+                if user_input.startswith('/'):
+                    cmd_parts = user_input.split()
+                    cmd = cmd_parts[0].lower()
+                    if cmd == '/exit' or cmd == '/quit': break
+                    elif cmd == '/auto':
+                        self.auto_mode = not self.auto_mode
+                        status = f"{Colors.GREEN}ON{Colors.RESET}" if self.auto_mode else f"{Colors.RED}OFF{Colors.RESET}"
+                        log_info(f"Auto-mode is now {status}")
+                        continue
+                    elif cmd == '/plan':
+                        self.planning_enabled = not self.planning_enabled
+                        status = f"{Colors.GREEN}ENABLED{Colors.RESET}" if self.planning_enabled else f"{Colors.RED}DISABLED{Colors.RESET}"
+                        log_info(f"Planning mode is now {status}")
+                        if self.planning_enabled:
+                            self.messages[0]['content'] = self.messages[0]['content'].replace("Planning is DISABLED. Do not use create_plan tool.", self.PLAN_PROMPT)
+                        else:
+                            self.messages[0]['content'] = self.messages[0]['content'].replace(self.PLAN_PROMPT, "Planning is DISABLED. Do not use create_plan tool.")
+                        continue
+                    elif cmd == '/save':
+                        path = cmd_parts[1] if len(cmd_parts) > 1 else None
+                        self.save_session(path)
+                        continue
+                    elif cmd == '/load':
+                        if len(cmd_parts) < 2:
+                            log_info("Usage: /load <filename>")
+                            continue
+                        self.load_session(cmd_parts[1])
+                        continue
+                    elif cmd == '/status':
+                        print(f"  {Colors.BOLD}Current Status:{Colors.RESET}")
+                        print(f"  {Colors.CYAN}Model:{Colors.RESET} {self.model_name}")
+                        print(f"  {Colors.CYAN}Auto-Mode:{Colors.RESET} {'ON' if self.auto_mode else 'OFF'}")
+                        print(f"  {Colors.CYAN}Planning:{Colors.RESET} {'ENABLED' if self.planning_enabled else 'DISABLED'}")
+                        print(f"  {Colors.CYAN}History:{Colors.RESET} {len(self.messages)} messages")
+                        continue
+                    elif cmd == '/tasks':
+                        self.print_tasks()
+                        continue
+                    elif cmd == '/help':
+                        print(f"  {Colors.BOLD}Available Commands:{Colors.RESET}")
+                        print(f"  {Colors.CYAN}/auto{Colors.RESET}   - Toggle auto-execution mode")
+                        print(f"  {Colors.CYAN}/plan{Colors.RESET}   - Toggle mandatory implementation planning")
+                        print(f"  {Colors.CYAN}/tasks{Colors.RESET}  - Show current progress checkpoints")
+                        print(f"  {Colors.CYAN}/save [f]{Colors.RESET} - Save current session to JSON")
+                        print(f"  {Colors.CYAN}/load <f>{Colors.RESET} - Load session from JSON")
+                        print(f"  {Colors.CYAN}/status{Colors.RESET} - Show current configuration")
+                        print(f"  {Colors.CYAN}/help{Colors.RESET}   - Show this help message")
+                        print(f"  {Colors.CYAN}/exit{Colors.RESET}   - Quit the application")
+                        continue
+                    else:
+                        log_info(f"Unknown command: {cmd}")
+                        continue
+
                 if user_input.lower() in ['exit', 'quit']: break
-                if user_input.lower() in ['continue', 'c', '']:
+                if user_input.lower() in ['continue', 'c']:
                     if len(self.messages) > 1: user_input = "Please continue."
                     else: continue
                 self.messages.append({'role': 'user', 'content': user_input})
@@ -314,47 +558,89 @@ class OCLI:
             except KeyboardInterrupt: break
 
     def process_chat(self):
-        available_tools = {'run_cmd': self.run_cmd, 'read_file': self.read_file, 'write_file': self.write_file, 'web_search': self.web_search}
+        available_tools = {'run_cmd': self.run_cmd, 'read_file': self.read_file, 'write_file': self.write_file, 'web_search': self.web_search, 'create_plan': self.create_plan, 'update_task': self.update_task, 'test_cmd': self.test_cmd, 'send_input': self.send_input}
         while True:
             try:
                 interrupter.start_listening()
-                stream = ollama.chat(
-                    model=self.model_name,
-                    messages=self.messages,
-                    stream=True,
-                    tools=[
-                        {'type': 'function', 'function': {'name': 'run_cmd', 'description': 'Run shell command', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}}},
-                        {'type': 'function', 'function': {'name': 'web_search', 'description': 'Search web via DuckDuckGo. Use authoritative domains for official-source searches.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}},
-                        {'type': 'function', 'function': {'name': 'read_file', 'description': 'Read file', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path']}}},
-                        {'type': 'function', 'function': {'name': 'write_file', 'description': 'Write file', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}}},
-                    ]
-                )
+                tools = [
+                    {'type': 'function', 'function': {'name': 'run_cmd', 'description': 'Run shell command', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}}},
+                    {'type': 'function', 'function': {'name': 'web_search', 'description': 'Search web via DuckDuckGo. Use authoritative domains for official-source searches.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}},
+                    {'type': 'function', 'function': {'name': 'read_file', 'description': 'Read file', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path']}}},
+                    {'type': 'function', 'function': {'name': 'write_file', 'description': 'Write file', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}}},
+                    {'type': 'function', 'function': {'name': 'test_cmd', 'description': 'Run command with live feedback (use for interactive tests or long processes).', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}}},
+                    {'type': 'function', 'function': {'name': 'send_input', 'description': 'Send text input to the active test process.', 'parameters': {'type': 'object', 'properties': {'text': {'type': 'string'}}, 'required': ['text']}}},
+                ]
+                if self.planning_enabled:
+                    tools.append({'type': 'function', 'function': {'name': 'create_plan', 'description': 'Create an implementation plan before performing complex tasks.', 'parameters': {'type': 'object', 'properties': {'plan': {'type': 'string'}}, 'required': ['plan']}}})
+                    tools.append({'type': 'function', 'function': {'name': 'update_task', 'description': 'Update the status of a task in the current plan.', 'parameters': {'type': 'object', 'properties': {'index': {'type': 'string', 'description': 'The 1-based index of the task'}, 'status': {'type': 'string', 'enum': ['todo', 'doing', 'done']}}, 'required': ['index', 'status']}}})
+
+                spinner = Spinner(f"{self.backend.capitalize()} is thinking...")
+                spinner.start()
+                
                 content, tool_calls, response_metadata = "", [], {}
-                print(f"\n{Colors.CYAN}{Colors.BOLD}OLAmma > {Colors.RESET}", end="", flush=True)
+                first_chunk = True
                 in_thought, line_buffer = False, ""
-                for chunk in stream:
-                    if interrupter.interrupted.is_set():
-                        print(f"\n  {Colors.RED}[INTERRUPTED]{Colors.RESET}")
-                        break
-                    msg = chunk.get('message', {})
-                    if 'content' in msg:
-                        token = msg['content']
-                        content += token
-                        if "<thought>" in token:
-                            in_thought = True
-                            print(f"{Colors.YELLOW}THINKING{Colors.RESET}", end="", flush=True)
-                        elif "</thought>" in token:
-                            in_thought = False
-                            token = token.replace("</thought>", "")
-                        if not in_thought:
-                            line_buffer += token
-                            if "\n" in line_buffer:
-                                parts = line_buffer.split("\n")
-                                for i in range(len(parts)-1):
-                                    print(render_text(parts[i] + "\n"), end="", flush=True)
-                                line_buffer = parts[-1]
-                    if 'tool_calls' in msg: tool_calls.extend(msg['tool_calls'])
-                    if 'total_duration' in chunk: response_metadata = chunk
+
+                if self.backend == 'ollama':
+                    stream = ollama.chat(model=self.model_name, messages=self.messages, stream=True, tools=tools)
+                    for chunk in stream:
+                        if first_chunk:
+                            spinner.stop()
+                            print(f"\n{Colors.CYAN}{Colors.BOLD}OLAmma > {Colors.RESET}", end="", flush=True)
+                            first_chunk = False
+                        if interrupter.interrupted.is_set(): break
+                        msg = chunk.get('message', {})
+                        if 'content' in msg:
+                            token = msg['content']
+                            content += token
+                           
+                            if "<thought>" in token:
+                                in_thought = True
+                                print(f"{Colors.YELLOW}THINKING{Colors.RESET}", end="", flush=True)
+                            elif "</thought>" in token:
+                                in_thought = False
+                                token = token.replace("</thought>", "")
+                            if not in_thought:
+                                line_buffer += token
+                                if "\n" in line_buffer:
+                                    parts = line_buffer.split("\n")
+                                    for i in range(len(parts)-1): print(render_text(parts[i] + "\n"), end="", flush=True)
+                                    line_buffer = parts[-1]
+                        if 'tool_calls' in msg: tool_calls.extend(msg['tool_calls'])
+                        if 'total_duration' in chunk: response_metadata = chunk
+                else:
+                   
+                    payload = {"model": self.model_name, "messages": self.messages, "stream": True, "tools": tools}
+                    r = requests.post(f"{self.url}/v1/chat/completions", json=payload, stream=True)
+                    for line in r.iter_lines():
+                        if interrupter.interrupted.is_set(): break
+                        if not line: continue
+                        line = line.decode('utf-8')
+                        if line.startswith('data: '):
+                            if line.strip() == 'data: [DONE]': break
+                            data = json.loads(line[6:])
+                            delta = data['choices'][0].get('delta', {})
+                            if 'content' in delta and delta['content']:
+                                if first_chunk:
+                                    spinner.stop()
+                                    print(f"\n{Colors.CYAN}{Colors.BOLD}OLAmma > {Colors.RESET}", end="", flush=True)
+                                    first_chunk = False
+                                token = delta['content']
+                                content += token
+                                line_buffer += token
+                                if "\n" in line_buffer:
+                                    parts = line_buffer.split("\n")
+                                    for i in range(len(parts)-1): print(render_text(parts[i] + "\n"), end="", flush=True)
+                                    line_buffer = parts[-1]
+                            if 'tool_calls' in delta:
+                                
+                                for tc in delta['tool_calls']:
+                                    if len(tool_calls) <= tc['index']: tool_calls.append({'function': {'name': '', 'arguments': ''}})
+                                    if 'function' in tc:
+                                        if 'name' in tc['function']: tool_calls[tc['index']]['function']['name'] += tc['function']['name']
+                                        if 'arguments' in tc['function']: tool_calls[tc['index']]['function']['arguments'] += tc['function']['arguments']
+                
+                spinner.stop()
                 if line_buffer and not in_thought: print(render_text(line_buffer), end="", flush=True)
                 print()
                 interrupter.stop_listening()
@@ -382,6 +668,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="qwen3.6:27b-coding-nvfp4")
     parser.add_argument("--auto", action="store_true")
+    parser.add_argument("--backend", type=str, choices=['ollama', 'llama-cpp'], default="ollama")
+    parser.add_argument("--url", type=str, help="Server URL (e.g. http://localhost:8080)")
     args = parser.parse_args()
-    agent = OCLI(model_name=args.model, auto_mode=args.auto)
+    agent = OCLI(model_name=args.model, auto_mode=args.auto, backend=args.backend, url=args.url)
     agent.run()
