@@ -350,12 +350,9 @@ class OCLI:
     def download_mlx_model(self, repo_id):
         try:
             log_tool(f"Downloading MLX Model: {repo_id}")
-            cmd = f"{sys.executable} -m huggingface_hub.commands.cli download {repo_id}"
+            cmd = f"hf download {repo_id}"
             return self.run_cmd(cmd)
         except Exception as e: return f"Error: {str(e)}"
-        except Exception as e:
-            interrupter.stop_listening()
-            return f"Test Failed: {str(e)}"
 
     def send_input(self, text):
         try:
