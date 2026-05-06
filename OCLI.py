@@ -17,6 +17,9 @@ import warnings
 import socket
 import atexit
 import signal
+import pty
+import array
+import fcntl
 warnings.simplefilter("ignore")
 try:
     from ddgs import DDGS
@@ -305,46 +308,51 @@ class OCLI:
 
     def test_cmd(self, command):
         try:
-            if self.active_process and self.active_process.poll() is None:
-                self.active_process.terminate()
-            
-            log_tool(f"TEST_EXEC: {command}")
+            if self.active_process and self.active_process.poll() is None: self.active_process.terminate()
+            log_tool(f"TEST_EXEC (PTY): {command}")
             interrupter.start_listening()
-            self.active_process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.PIPE, text=True, bufsize=1)
+            master, slave = pty.openpty()
+            self.active_process = subprocess.Popen(command, shell=True, stdout=slave, stderr=slave, stdin=slave, text=True, close_fds=True)
+            os.close(slave)
+            fcntl.fcntl(master, fcntl.F_SETFL, os.O_NONBLOCK)
             output = []
             print(f"\n  {Colors.MAGENTA}{Colors.BOLD}[TEST_EXEC_OUTPUT]{Colors.RESET}")
-            
             last_output_time = time.time()
             while True:
                 if interrupter.interrupted.is_set():
                     self.active_process.terminate()
+                    os.close(master)
                     print(f"\n  {Colors.RED}[INTERRUPTED]{Colors.RESET}")
                     interrupter.stop_listening()
                     return "Test interrupted."
-                
-                rlist, _, _ = select.select([self.active_process.stdout], [], [], 0.5)
-                
-                if rlist:
-                    line = self.active_process.stdout.readline()
-                    if line:
-                        print(line, end="")
-                        output.append(line)
+                try:
+                    data = os.read(master, 1024).decode(errors='ignore')
+                    if data:
+                        sys.stdout.write(data)
+                        sys.stdout.flush()
+                        output.append(data)
                         last_output_time = time.time()
-                        continue
-                
+                except (BlockingIOError, OSError): pass
                 if self.active_process.poll() is not None: break
-                
                 if time.time() - last_output_time > 5:
-                    print(f"\n  {Colors.YELLOW}[LIVE_FEEDBACK] No output for 5s. Waiting for AI input...{Colors.RESET}")
+                    print(f"\n  {Colors.YELLOW}[LIVE_FEEDBACK] Process waiting for input...{Colors.RESET}")
                     interrupter.stop_listening()
-                    buffer = "".join(output[-200:])
+                    buffer = "".join(output[-1000:])
                     return f"LIVE_FEEDBACK (Process waiting for input):\n{buffer}\nUse 'send_input' to interact."
-                    
-            self.active_process.stdout.close()
-            if self.active_process.stdin: self.active_process.stdin.close()
-            self.active_process.wait()
+                time.sleep(0.1)
+            os.close(master)
             interrupter.stop_listening()
             return f"Test Completed. Output:\n" + "".join(output)
+        except Exception as e:
+            interrupter.stop_listening()
+            return f"Error: {str(e)}"
+
+    def download_mlx_model(self, repo_id):
+        try:
+            log_tool(f"Downloading MLX Model: {repo_id}")
+            cmd = f"{sys.executable} -m huggingface_hub.commands.cli download {repo_id}"
+            return self.run_cmd(cmd)
+        except Exception as e: return f"Error: {str(e)}"
         except Exception as e:
             interrupter.stop_listening()
             return f"Test Failed: {str(e)}"
@@ -612,10 +620,10 @@ class OCLI:
         print(f"{Colors.GRAY}[SYS] Type 'exit' to quit.{Colors.RESET}")
         while True:
             try:
-                print("-" * 200)
+                print("-" * 60)
                 user_input = input(f"\n{Colors.YELLOW}{Colors.BOLD}[VibeCoder] > {Colors.RESET}").strip()
                 print("")
-                print("-" * 200)
+                print("-" * 60)
                 if not user_input: continue
                 if user_input.startswith('/'):
                     cmd_parts = user_input.split()
@@ -666,6 +674,7 @@ class OCLI:
                         print(f"  {Colors.CYAN}/save [f]{Colors.RESET}  - Save current session to JSON")
                         print(f"  {Colors.CYAN}/load <f>{Colors.RESET}  - Load session from JSON")
                         print(f"  {Colors.CYAN}/setup_mlx{Colors.RESET} - Auto-install and download MLX models")
+                        print(f"  {Colors.CYAN}/download <r>{Colors.RESET} - Download an MLX model from Hugging Face")
                         print(f"  {Colors.CYAN}/exit{Colors.RESET}      - Quit the application")
                         print(f"\n  {Colors.GRAY}Note: The AI automatically uses tools like 'read_url' and 'web_search' for exploration.{Colors.RESET}")
                         continue
@@ -674,6 +683,12 @@ class OCLI:
                         continue
                     elif cmd == '/setup_mlx':
                         self.setup_mlx()
+                        continue
+                    elif cmd == '/download':
+                        if len(cmd_parts) < 2:
+                            log_info("Usage: /download <repo_id>")
+                            continue
+                        self.download_mlx_model(cmd_parts[1])
                         continue
                     else:
                         log_info(f"Unknown command: {cmd}")
@@ -698,7 +713,7 @@ class OCLI:
 
     def process_chat(self):
         had_tool_calls = False
-        available_tools = {'run_cmd': self.run_cmd, 'read_file': self.read_file, 'write_file': self.write_file, 'web_search': self.web_search, 'create_plan': self.create_plan, 'update_task': self.update_task, 'test_cmd': self.test_cmd, 'send_input': self.send_input, 'read_url': self.read_url}
+        available_tools = {'run_cmd': self.run_cmd, 'read_file': self.read_file, 'write_file': self.write_file, 'web_search': self.web_search, 'create_plan': self.create_plan, 'update_task': self.update_task, 'test_cmd': self.test_cmd, 'send_input': self.send_input, 'read_url': self.read_url, 'download_mlx_model': self.download_mlx_model}
         while True:
             try:
                 interrupter.start_listening()
@@ -706,6 +721,7 @@ class OCLI:
                     {'type': 'function', 'function': {'name': 'run_cmd', 'description': 'Run shell command', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}}},
                     {'type': 'function', 'function': {'name': 'web_search', 'description': 'Search web via DuckDuckGo. Use authoritative domains for official-source searches.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}, 'num_results': {'type': 'integer', 'default': 10}}, 'required': ['query']}}},
                     {'type': 'function', 'function': {'name': 'read_url', 'description': 'Fetch and read the text content of a URL.', 'parameters': {'type': 'object', 'properties': {'url': {'type': 'string'}}, 'required': ['url']}}},
+                    {'type': 'function', 'function': {'name': 'download_mlx_model', 'description': 'Download an MLX model from Hugging Face.', 'parameters': {'type': 'object', 'properties': {'repo_id': {'type': 'string'}}, 'required': ['repo_id']}}},
                     {'type': 'function', 'function': {'name': 'read_file', 'description': 'Read file', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path']}}},
                     {'type': 'function', 'function': {'name': 'write_file', 'description': 'Write file', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}}},
                     {'type': 'function', 'function': {'name': 'test_cmd', 'description': 'Run command with live feedback (use for interactive tests or long processes).', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}}},
