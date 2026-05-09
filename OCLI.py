@@ -837,6 +837,27 @@ def recover_tool_call_from_text(text):
         return None
     return {'function': {'name': name, 'arguments': args}}
 
+def normalize_tool_call(tc):
+    if isinstance(tc, dict):
+        return tc
+    try:
+        d = tc.model_dump()
+        if isinstance(d, dict) and 'function' in d:
+            return d
+    except (AttributeError, Exception):
+        pass
+    try:
+        func = tc.function
+        return {
+            'function': {
+                'name': getattr(func, 'name', None),
+                'arguments': getattr(func, 'arguments', {}) or {}
+            }
+        }
+    except (AttributeError, Exception):
+        pass
+    return {'function': {'name': None, 'arguments': {}}}
+
 def direct_command_from_user(text):
     cleaned = str(text).strip()
     match = re.match(r'^(?:(?:please|can you|could you|would you)\s+)?(?:run|execute)\s+(?:the\s+)?(?:command\s+)?(.+?)[?.!]*$', cleaned, flags=re.IGNORECASE)
@@ -1804,7 +1825,7 @@ class OCLI:
                         if interrupter.interrupted.is_set(): break
                         msg = chunk.get('message', {})
                         if 'content' in msg: process_token(msg['content'])
-                        if 'tool_calls' in msg: tool_calls.extend(msg['tool_calls'])
+                        if 'tool_calls' in msg and msg['tool_calls']: tool_calls.extend(normalize_tool_call(tc) for tc in msg['tool_calls'])
                         if 'total_duration' in chunk: response_metadata = chunk
                 else:
                     payload = {"model": self.model_name, "messages": self.server_messages(), "stream": True}
