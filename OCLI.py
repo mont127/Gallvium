@@ -540,6 +540,12 @@ COMPACT_RECENT_MESSAGES = 12
 COMPACT_MAX_MESSAGE_CHARS = 2200
 DANGEROUS_PATTERNS = [r'\brm\b', r'\bmv\b', r'\bsudo\b', r'\bchmod\b', r'\bchown\b', r'\bdd\b', r'\bmkfs\b', r'\bformat\b', r'\bkill\b', r'>\s*/dev/', r'\bshred\b', r'\bwipe\b']
 ALLOWED_SEARCH_DOMAINS = ["ollama.com", "googleblog.com", "ai.google.dev", "huggingface.co"]
+CLI_COMMAND_NAME = "OCLI"
+CLI_INSTALL_PATHS = [
+    "/usr/local/bin/OCLI",
+    os.path.expanduser("~/.local/bin/OCLI"),
+    "/bin/OCLI",
+]
 BACKEND_DEFAULT_URLS = {
     "ollama": "http://localhost:11434",
     "llama-cpp": "http://localhost:8080",
@@ -548,7 +554,7 @@ BACKEND_DEFAULT_URLS = {
 BACKEND_DEFAULT_MODELS = {
     "ollama": "qwen3.6:27b-coding-nvfp4",
     "llama-cpp": "qwen2.5-coder-1.5b",
-    "mlx": "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+    "mlx": "mlx-community/Qwen3.5-0.8B-OptiQ-4bit",
 }
 OLLAMA_MODELS = [
     "qwen3.6:27b-coding-nvfp4",
@@ -612,12 +618,12 @@ OLLAMA_MODELS = [
     "llama3.2-vision",
 ]
 MLX_MODELS = [
-    "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
-    "mlx-community/Qwen3-8B-4bit",
-    "mlx-community/gemma-3-4b-it-4bit",
     "mlx-community/Qwen3.5-0.8B-OptiQ-4bit",
     "mlx-community/Qwen3.5-2B-OptiQ-4bit",
     "mlx-community/Qwen3.5-4B-OptiQ-4bit",
+    "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+    "mlx-community/Qwen3-8B-4bit",
+    "mlx-community/gemma-3-4b-it-4bit",
     "mlx-community/Qwen3.5-9B-MLX-4bit",
     "mlx-community/Qwen3.6-35B-A3B-4bit",
     "mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit",
@@ -715,6 +721,49 @@ def domain_matches(url, allowed_domains):
     lowered = url.lower()
     return any(domain in lowered for domain in allowed_domains)
 
+def launcher_matches_source(path, source):
+    try:
+        with open(path, "r") as f:
+            return source in f.read()
+    except Exception:
+        return False
+
+def command_on_path(name):
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+def install_cli_launcher():
+    if os.environ.get("OCLI_SKIP_INSTALL") == "1":
+        return
+    source = os.path.abspath(__file__)
+    existing = command_on_path(CLI_COMMAND_NAME)
+    if existing and launcher_matches_source(existing, source):
+        return
+    wrapper = f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(source)} \"$@\"\n"
+    errors = []
+    for path in CLI_INSTALL_PATHS:
+        if os.path.exists(path):
+            if launcher_matches_source(path, source):
+                return
+            errors.append(f"{path} already exists")
+            continue
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(wrapper)
+            os.chmod(path, 0o755)
+            log_info(f"Installed launcher: {Colors.TEAL}{path}{Colors.RESET}")
+            if os.path.dirname(path) not in os.environ.get("PATH", "").split(os.pathsep):
+                log_info(f"Add {Colors.TEAL}{os.path.dirname(path)}{Colors.RESET} to PATH to run {Colors.TEAL}OCLI{Colors.RESET} directly.")
+            return
+        except Exception as e:
+            errors.append(f"{path}: {e}")
+    if can_use_terminal_keys():
+        log_info("Could not install OCLI launcher automatically. Try running with permissions for /usr/local/bin or create a launcher manually.")
+
 def model_matches_backend(model, backend):
     if not model:
         return False
@@ -724,6 +773,10 @@ def model_matches_backend(model, backend):
     if backend == "llama-cpp":
         return lowered.endswith(".gguf") or "gguf" in lowered or model.startswith(("/", ".", "~"))
     return not model.startswith("mlx-community/") and "gguf" not in lowered and not lowered.endswith(".gguf")
+
+def is_large_mlx_model(model):
+    lowered = str(model).lower()
+    return any(size in lowered for size in ["24b", "26b", "27b", "31b", "32b", "35b", "40b", "70b"])
 
 def truncate_output(output):
     if len(str(output)) > MAX_OUTPUT_LENGTH: return str(output)[:MAX_OUTPUT_LENGTH] + f"\n\n[Output truncated due to size.]"
@@ -760,33 +813,65 @@ def extract_json_objects(text):
     return objects
 
 def recover_tool_call_from_text(text):
-    name_match = re.search(r'"name"\s*:\s*"([^"]+)"', text)
-    if not name_match:
-        return None
-    name = name_match.group(1)
-
+    name_match = re.search(r'["\']?name["\']?\s*:\s*["\']?([A-Za-z_][\w-]*)["\']?', text)
     args = {}
     arg_keys = ['command', 'path', 'content', 'plan', 'query', 'text', 'url', 'pattern', 'repo_id', 'index', 'status', 'key', 'value']
     for key in arg_keys:
-        match = re.search(rf'"{key}"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+        match = re.search(rf'["\']?{key}["\']?\s*:\s*("((?:\\.|[^"\\])*)"|\'((?:\\.|[^\'\\])*)\'|([^,}}\n]+))', text)
         if match:
+            raw_value = next((group for group in match.groups()[1:] if group is not None), "")
+            raw_value = raw_value.strip()
             try:
-                args[key] = bytes(match.group(1), "utf-8").decode("unicode_escape")
+                args[key] = bytes(raw_value, "utf-8").decode("unicode_escape")
             except Exception:
-                args[key] = match.group(1)
-    num_match = re.search(r'"num_results"\s*:\s*(\d+)', text)
+                args[key] = raw_value
+    num_match = re.search(r'["\']?num_results["\']?\s*:\s*(\d+)', text)
     if num_match:
         args["num_results"] = int(num_match.group(1))
-
     if not args: return None
+    if name_match:
+        name = name_match.group(1)
+    elif re.search(r'\brun_cmd\b', text) or 'command' in args:
+        name = 'run_cmd'
+    else:
+        return None
     return {'function': {'name': name, 'arguments': args}}
+
+def direct_command_from_user(text):
+    cleaned = str(text).strip()
+    match = re.match(r'^(?:(?:please|can you|could you|would you)\s+)?(?:run|execute)\s+(?:the\s+)?(?:command\s+)?(.+?)[?.!]*$', cleaned, flags=re.IGNORECASE)
+    if not match:
+        match = re.match(r'^(?:(?:please|can you|could you|would you)\s+)?use\s+(?:the\s+)?command\s+(.+?)[?.!]*$', cleaned, flags=re.IGNORECASE)
+    if not match:
+        match = re.match(r'^(?:(?:please|can you|could you|would you)\s+)?command\s+(.+?)[?.!]*$', cleaned, flags=re.IGNORECASE)
+    if not match:
+        return None
+    command = match.group(1).strip()
+    if not command:
+        return None
+    command = re.sub(r'[?.!]+$', '', command).strip()
+    command = command.strip("`'\" ")
+    try:
+        first = shlex.split(command)[0]
+    except Exception:
+        return None
+    allowed = {
+        'pwd', 'ls', 'find', 'rg', 'grep', 'cat', 'sed', 'awk', 'head', 'tail', 'wc',
+        'git', 'python', 'python3', 'pytest', 'pip', 'pip3', 'uv', 'npm', 'node',
+        'pnpm', 'yarn', 'bun', 'make', 'cargo', 'go', 'java', 'javac', 'curl',
+        'wget', 'hf', 'ollama', 'which', 'whoami', 'date', 'uname', 'df', 'du',
+        'ps', 'env', 'printenv'
+    }
+    return command if first in allowed else None
 
 class OCLI:
     def __init__(self, model_name, auto_mode=False, backend='ollama', url=None):
-        self.model_name = model_name
+        self.model_name = model_name or BACKEND_DEFAULT_MODELS.get(backend, BACKEND_DEFAULT_MODELS["ollama"])
         self.auto_mode = auto_mode
         self.backend = backend
         self.url = url or BACKEND_DEFAULT_URLS.get(backend, "http://localhost:8080")
+        if not model_matches_backend(self.model_name, self.backend):
+            self.model_name = BACKEND_DEFAULT_MODELS.get(self.backend, self.model_name)
         self.planning_enabled = False
         self.tasks = []
         self.active_process = None
@@ -798,6 +883,7 @@ class OCLI:
         self.repeated_failure_count = 0
         self.tool_steps_this_turn = 0
         self.compaction_count = 0
+        self.server_model = None
         self.PLAN_PROMPT = "Planning is ENABLED. Before performing complex tasks, multiple file edits, or potentially destructive operations, you MUST create an implementation plan using the 'create_plan' tool. Break the plan down into discrete, numbered tasks that cover every explicit user requirement. As you work, use the 'update_task' tool to mark tasks as 'doing' and 'done'. After the plan is approved, continue by making real tool calls."
         cur_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.messages = [{
@@ -806,7 +892,7 @@ class OCLI:
                 f"You are OCLI, an advanced AUTONOMOUS AI coding agent. Current date: {cur_date}. "
                 "CONVERSATION RULES: For greetings, questions, explanations, or any non-task message, respond in plain natural language. Do NOT call tools or output JSON for simple conversation. Only use tools when the user explicitly asks you to perform an action (run code, edit files, search, etc.). "
                 "Wrap internal reasoning in <thought> tags. "
-                "To call a tool, output exactly one tool call and nothing else: <tools>{{\"name\": \"tool_name\", \"arguments\": {{...}}}}</tools>. For coding tasks, write the complete requested implementation first, then write tests, then run pytest, then fix failures, then summarize final files. "
+                "To call a tool, output exactly one tool call and nothing else: <tools>{{\"name\": \"tool_name\", \"arguments\": {{...}}}}</tools>. For shell commands, use <tools>{{\"name\":\"run_cmd\",\"arguments\":{{\"command\":\"pwd\"}}}}</tools> with the requested command. Available tools include run_cmd, read_file, write_file, test_cmd, list_files, search_files, grep, web_search, read_url, git_status, and git_diff. For coding tasks, write the complete requested implementation first, then write tests, then run pytest, then fix failures, then summarize final files. "
                 "Do not write markdown code blocks when creating or editing files; use the write_file tool. Do not describe running commands; use run_cmd or test_cmd. Do not fabricate tool results, diffs, test output, file contents, or <tool_response> blocks. If a user asks you to create code, modify code, inspect files, run tests, install packages, or execute a program, you MUST call a real tool. "
                 "For multi-step tasks, after each successful real tool call, immediately make the next required real tool call only if it advances the original user request; do not output bare CONTINUE as a standalone response, and do not repeatedly run the same command or read/write the same file without changing strategy. If a test fails twice with the same error, inspect the file tree and relevant files before editing again. "
                 "CRITICAL: Use the 'test_cmd' tool for ANY command that might be interactive (games, prompts, servers). DO NOT use 'run_cmd' for these. MANDATORY: Always use 'write_file' for all code modifications to ensure the user sees a diff report. When the user asks for multiple searches, perform at least 3-5 searches. "
@@ -814,7 +900,7 @@ class OCLI:
             )
         }]
         self.server_process = None
-        if self.backend == 'mlx': self.ensure_mlx_server()
+        if self.backend == 'mlx': log_info("MLX backend selected. The model will load on the first prompt.")
         atexit.register(self.cleanup)
 
     def cleanup(self):
@@ -824,6 +910,7 @@ class OCLI:
             try: self.server_process.wait(timeout=5)
             except: self.server_process.kill()
             self.server_process = None
+        self.server_model = None
 
     def menu_choice(self, title, options):
         return interactive_menu(title, options, Colors.VIOLET)
@@ -835,17 +922,21 @@ class OCLI:
 
     def set_backend(self, backend, url=None, keep_model=False):
         previous_backend = self.backend
-        if previous_backend == 'mlx' and backend != 'mlx':
+        previous_url = self.url
+        next_url = url or BACKEND_DEFAULT_URLS.get(backend, "http://localhost:8080")
+        if previous_backend == 'mlx' and (backend != 'mlx' or next_url != previous_url):
             self.cleanup()
         self.backend = backend
-        self.url = url or BACKEND_DEFAULT_URLS.get(backend, "http://localhost:8080")
+        self.url = next_url
         if keep_model and not model_matches_backend(self.model_name, backend):
             log_info(f"Current model {Colors.TEAL}{self.model_name}{Colors.RESET} is not compatible with {Colors.TEAL}{backend}{Colors.RESET}; using the backend default.")
             keep_model = False
         if not keep_model:
             self.model_name = BACKEND_DEFAULT_MODELS.get(backend, self.model_name)
         if self.backend == 'mlx':
-            self.ensure_mlx_server()
+            log_info("MLX model will load on the first prompt.")
+            if is_large_mlx_model(self.model_name):
+                log_info("Large MLX model selected; the first prompt can take several minutes while weights load into memory.")
         log_info(f"Backend switched to {Colors.TEAL}{self.backend}{Colors.RESET} using {Colors.TEAL}{self.url}{Colors.RESET}")
         log_info(f"Model is now {Colors.TEAL}{self.model_name}{Colors.RESET}")
 
@@ -900,8 +991,13 @@ class OCLI:
                 return
             self.model_name = model
         if self.backend == 'mlx':
-            self.cleanup()
-            self.ensure_mlx_server()
+            if self.server_process and self.server_model != self.model_name:
+                self.cleanup()
+            elif self.server_model != self.model_name:
+                self.server_model = None
+            log_info("MLX model will load on the next prompt.")
+            if is_large_mlx_model(self.model_name):
+                log_info("Large MLX model selected; the first prompt can take several minutes while weights load into memory.")
         log_info(f"Model switched to {Colors.TEAL}{self.model_name}{Colors.RESET}")
 
     def run_model_download(self, model_name, url=None):
@@ -962,9 +1058,17 @@ class OCLI:
         host = self.url.split("//")[-1].split(":")[0]
         try: port = int(self.url.split(":")[-1])
         except: port = 8080
-        
+
+        if self.server_process and self.server_process.poll() is not None:
+            self.server_process = None
+            self.server_model = None
+        if self.server_process and self.server_model != self.model_name:
+            self.cleanup()
+        if self.server_process and self.server_model == self.model_name and self.is_port_open(host, port):
+            return
         if self.is_port_open(host, port):
             log_info(f"MLX Server already running on {host}:{port}")
+            self.server_model = self.model_name
             return
 
         log_info(f"Auto-starting MLX Server with model: {self.model_name}")
@@ -974,6 +1078,7 @@ class OCLI:
             log_info("Waiting for MLX server to initialize...")
             for _ in range(30):
                 if self.is_port_open(host, port):
+                    self.server_model = self.model_name
                     log_info("MLX Server is ready!")
                     return
                 time.sleep(1)
@@ -1462,6 +1567,20 @@ class OCLI:
             self.messages = [system_msg, {'role': 'assistant', 'content': memory}] + recent_context
             log_info(f"Compaction successful. Preserved {len(recent_context)} recent messages.")
 
+    def server_messages(self):
+        prepared = []
+        for message in self.messages:
+            role = message.get('role', 'user')
+            content = message.get('content', '') or ''
+            if role == 'tool':
+                name = message.get('name') or 'tool'
+                prepared.append({'role': 'user', 'content': f"Tool result from {name}:\n{content}"})
+            elif role in ['system', 'user', 'assistant']:
+                prepared.append({'role': role, 'content': content})
+            else:
+                prepared.append({'role': 'user', 'content': content})
+        return prepared
+
     def run(self):
         print_logo()
         print_panel("SESSION", [
@@ -1527,8 +1646,13 @@ class OCLI:
                         if len(cmd_parts) > 1:
                             self.model_name = " ".join(cmd_parts[1:])
                             if self.backend == 'mlx':
-                                self.cleanup()
-                                self.ensure_mlx_server()
+                                if self.server_process and self.server_model != self.model_name:
+                                    self.cleanup()
+                                elif self.server_model != self.model_name:
+                                    self.server_model = None
+                                log_info("MLX model will load on the next prompt.")
+                                if is_large_mlx_model(self.model_name):
+                                    log_info("Large MLX model selected; the first prompt can take several minutes while weights load into memory.")
                             log_info(f"Model switched to {Colors.TEAL}{self.model_name}{Colors.RESET}")
                         else:
                             self.model_menu()
@@ -1593,7 +1717,7 @@ class OCLI:
                     should_continue = (
                         (had_tools and self.auto_mode)
                         or ("CONTINUE" in last_msg.upper() and auto_count < 3)
-                        or (self.messages[-1].get('role') == 'tool' and auto_count < 3)
+                        or (had_tools and self.auto_mode and self.messages[-1].get('role') == 'tool' and auto_count < 3)
                     )
                     if should_continue:
                         auto_count += 1
@@ -1606,8 +1730,11 @@ class OCLI:
     def process_chat(self):
         had_tool_calls = False
         available_tools = {'run_cmd': self.run_cmd, 'read_file': self.read_file, 'write_file': self.write_file, 'web_search': self.web_search, 'create_plan': self.create_plan, 'update_task': self.update_task, 'test_cmd': self.test_cmd, 'send_input': self.send_input, 'read_url': self.read_url, 'download_mlx_model': self.download_mlx_model, 'list_files': self.list_files, 'search_files': self.search_files, 'grep': self.grep, 'git_status': self.git_status, 'git_diff': self.git_diff}
+        tool_reprompt_count = 0
+        invalid_tool_reprompt_count = 0
         while True:
             try:
+                spinner = None
                 interrupter.start_listening()
                 tools = [
                     {'type': 'function', 'function': {'name': 'run_cmd', 'description': 'Run shell command', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}}},
@@ -1627,6 +1754,9 @@ class OCLI:
                 if self.planning_enabled:
                     tools.append({'type': 'function', 'function': {'name': 'create_plan', 'description': 'Create an implementation plan before performing complex tasks.', 'parameters': {'type': 'object', 'properties': {'plan': {'type': 'string'}}, 'required': ['plan']}}})
                     tools.append({'type': 'function', 'function': {'name': 'update_task', 'description': 'Update the status of a task in the current plan.', 'parameters': {'type': 'object', 'properties': {'index': {'type': 'string', 'description': 'The 1-based index of the task'}, 'status': {'type': 'string', 'enum': ['todo', 'doing', 'done']}}, 'required': ['index', 'status']}}})
+
+                if self.backend == 'mlx':
+                    self.ensure_mlx_server()
 
                 spinner = Spinner(f"{self.backend.capitalize()} generating")
                 spinner.start()
@@ -1677,12 +1807,24 @@ class OCLI:
                         if 'tool_calls' in msg: tool_calls.extend(msg['tool_calls'])
                         if 'total_duration' in chunk: response_metadata = chunk
                 else:
-                    payload = {"model": self.model_name, "messages": self.messages, "stream": True, "tools": tools}
-                    r = requests.post(f"{self.url}/v1/chat/completions", json=payload, stream=True)
+                    payload = {"model": self.model_name, "messages": self.server_messages(), "stream": True}
+                    try:
+                        r = requests.post(f"{self.url}/v1/chat/completions", json=payload, stream=True)
+                    except requests.RequestException as e:
+                        spinner.stop()
+                        interrupter.stop_listening()
+                        log_info(f"Server request failed: {e}")
+                        self.messages.append({'role': 'assistant', 'content': f"[SERVER ERROR] {e}"})
+                        return False
                     if r.status_code != 200:
+                        spinner.stop()
+                        interrupter.stop_listening()
                         log_info(f"Server Error ({r.status_code}): {r.text}")
-                        break
+                        self.messages.append({'role': 'assistant', 'content': f"[SERVER ERROR {r.status_code}] {r.text}"})
+                        return False
+                    spinner.stop()
                     log_info(f"Connected to {self.backend} server. Awaiting response...")
+                    spinner.start()
                     for line in r.iter_lines():
                         if interrupter.interrupted.is_set(): break
                         if not line: continue
@@ -1740,11 +1882,20 @@ class OCLI:
                 user_context = "\n".join(m.get('content', '') for m in self.messages[-3:] if m.get('role') == 'user').lower()
                 fake_tool_markers = ['<tool_response>', '</tool_response>', 'running tasklite.py...', 'diff --git']
                 tool_required_phrases = ['create ', 'write ', 'edit ', 'modify ', 'fix ', 'test ', 'run ', 'execute ', 'pytest', 'tasklite.py', 'devlog.py', 'test_devlog.py', 'readme.md']
-                needs_real_tool = any(phrase in user_context for phrase in tool_required_phrases)
-                appears_fake_tool_result = any(marker in lower_content for marker in fake_tool_markers)
+                needs_real_tool = not had_tool_calls and any(phrase in user_context for phrase in tool_required_phrases)
+                appears_fake_tool_result = not had_tool_calls and any(marker in lower_content for marker in fake_tool_markers)
                 bare_continue = content.strip().upper() == "CONTINUE"
                 hardware_queries = ['vram', 'gpu memory', 'video memory', 'unified memory', 'how much memory']
-                if not tool_calls and any(term in user_context for term in hardware_queries):
+                direct_command = direct_command_from_user(self.last_user_goal)
+                if not tool_calls and not had_tool_calls and direct_command:
+                    log_info(f"Model did not emit a valid tool call; using recovered command: {Colors.TEAL}{direct_command}{Colors.RESET}")
+                    tool_calls.append({
+                        'function': {
+                            'name': 'run_cmd',
+                            'arguments': {'command': direct_command}
+                        }
+                    })
+                elif not tool_calls and not had_tool_calls and any(term in user_context for term in hardware_queries):
                     log_info("Using deterministic hardware inspection command")
                     tool_calls.append({
                         'function': {
@@ -1755,6 +1906,11 @@ class OCLI:
                         }
                     })
                 elif not tool_calls and (needs_real_tool or appears_fake_tool_result or bare_continue):
+                    tool_reprompt_count += 1
+                    if tool_reprompt_count > 2:
+                        log_info("No valid tool call produced after retries.")
+                        self.messages.append({'role': 'assistant', 'content': content or "[No valid tool call produced.]"})
+                        return False
                     self.messages.append({'role': 'assistant', 'content': content or ""})
                     self.messages.append({'role': 'user', 'content': "Continue the user's original task with the next required real tool call. Do not output bare CONTINUE. Do not describe or simulate tool output. Emit exactly one <tools>{...}</tools> call with complete JSON arguments."})
                     continue
@@ -1902,19 +2058,32 @@ class OCLI:
                         result = truncate_output(self.run_cmd("system_profiler SPDisplaysDataType SPHardwareDataType | sed -n '/Chipset Model/p;/VRAM/p;/Total Number of Cores/p;/Memory:/p;/Model Name/p;/Chip/p'"))
                         self.messages.append({'role': 'tool', 'content': result, 'tool_call_id': 'hardware_fallback_' + str(int(time.time())), 'name': 'run_cmd'})
                         return True
+                    invalid_tool_reprompt_count += 1
+                    if invalid_tool_reprompt_count > 2:
+                        log_info("No valid tool call produced after retries.")
+                        self.messages.append({'role': 'assistant', 'content': "[No valid tool call produced after retries.]"})
+                        return False
                     self.messages.append({'role': 'user', 'content': f"Your previous tool call was invalid, incomplete, or repetitive. Original request:\n{self.last_user_goal}\nRespond with one complete JSON tool call that advances the task, or give the final summary only if the task is actually complete."})
                     continue
                 continue
             except Exception as e:
+                if spinner:
+                    spinner.stop()
+                interrupter.stop_listening()
+                self.messages.append({'role': 'assistant', 'content': f"[OCLI ERROR] {e}"})
                 print(f"{Colors.RED}Error: {e}{Colors.RESET}")
                 return False
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default=BACKEND_DEFAULT_MODELS["ollama"])
+    parser.add_argument("--model", type=str)
     parser.add_argument("--auto", action="store_true")
     parser.add_argument("--backend", type=str, choices=['ollama', 'llama-cpp', 'mlx'], default="ollama")
     parser.add_argument("--url", type=str, help="Server URL (e.g. http://localhost:8080)")
+    parser.add_argument("--skip-install", action="store_true", help="Skip automatic OCLI launcher installation")
     args = parser.parse_args()
-    agent = OCLI(model_name=args.model, auto_mode=args.auto, backend=args.backend, url=args.url)
+    if args.skip_install:
+        os.environ["OCLI_SKIP_INSTALL"] = "1"
+    install_cli_launcher()
+    agent = OCLI(model_name=args.model or BACKEND_DEFAULT_MODELS[args.backend], auto_mode=args.auto, backend=args.backend, url=args.url)
     agent.run()
