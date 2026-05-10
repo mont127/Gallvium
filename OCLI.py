@@ -520,17 +520,21 @@ def print_diff(diff_lines):
 def print_logo():
     logo = rf"""{Colors.TEAL}{Colors.BOLD}
 ╭────────────────────────────────────────────────────────────────────────────╮
-│                                                                            │
-│   ██████╗  ██████╗██╗     ██╗       ██████╗ ██████╗ ██████╗ ███████╗       │
-│  ██╔═══██╗██╔════╝██║     ██║      ██╔════╝██╔═══██╗██╔══██╗██╔════╝       │
-│  ██║   ██║██║     ██║     ██║█████╗██║     ██║   ██║██║  ██║█████╗         │
-│  ██║   ██║██║     ██║     ██║╚════╝██║     ██║   ██║██║  ██║██╔══╝         │
-│  ╚██████╔╝╚██████╗███████╗██║      ╚██████╗╚██████╔╝██████╔╝███████╗       │
-│   ╚═════╝  ╚═════╝╚══════╝╚═╝       ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝       │
-│                                                                            │
+│   *        .          *            .        *              *        .      │
+│       .        *             .         *              .        *           │
+│          *             .          *          .            *                │
+│   ██████╗  █████╗ ██╗     ██╗     ██╗██╗   ██╗██╗██╗   ██╗███╗   ███╗      │
+│  ██╔════╝ ██╔══██╗██║     ██║     ██║██║   ██║██║██║   ██║████╗ ████║      │
+│  ██║  ███╗███████║██║     ██║     ██║██║   ██║██║██║   ██║██╔████╔██║      │
+│  ██║   ██║██╔══██║██║     ██║     ██║╚██╗ ██╔╝██║██║   ██║██║╚██╔╝██║      │
+│  ╚██████╔╝██║  ██║███████╗███████╗██║ ╚████╔╝ ██║╚██████╔╝██║ ╚═╝ ██║      │
+│   ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═══╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝      │
+│       .         *              .           *        .              *       │
+│   *        .          *            .        *              *        .      │
+│          .       *          .             *         .        *             │
 ╰────────────────────────────────────────────────────────────────────────────╯
 {Colors.RESET}{Colors.PINK}{Colors.BOLD}        local models  ✦  shell tools  ✦  files  ✦  web  ✦  autonomous coding{Colors.RESET}
-{Colors.GRAY}        Free open-source AI coding assistant for the terminal{Colors.RESET}
+{Colors.GRAY}        Gallivium AI coding assistant for the terminal{Colors.RESET}
 """
     print(logo)
 
@@ -550,11 +554,13 @@ BACKEND_DEFAULT_URLS = {
     "ollama": "http://localhost:11434",
     "llama-cpp": "http://localhost:8080",
     "mlx": "http://localhost:8080",
+    "airllm": None,
 }
 BACKEND_DEFAULT_MODELS = {
     "ollama": "qwen3.6:27b-coding-nvfp4",
     "llama-cpp": "qwen2.5-coder-1.5b",
     "mlx": "mlx-community/Qwen3.5-0.8B-OptiQ-4bit",
+    "airllm": "Qwen/Qwen2.5-72B-Instruct",
 }
 OLLAMA_MODELS = [
     "qwen3.6:27b-coding-nvfp4",
@@ -692,15 +698,32 @@ GGUF_MODELS = [
 LLAMA_CPP_URLS = {
     "Qwen2.5-Coder-1.5B-Instruct-GGUF": "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
 }
+AIRLLM_MODELS = [
+    "Qwen/Qwen2.5-72B-Instruct",
+    "Qwen/Qwen2.5-Coder-32B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct",
+    "meta-llama/Llama-3.1-70B-Instruct",
+    "meta-llama/Llama-3.1-405B-Instruct",
+    "meta-llama/Llama-3-70B-Instruct",
+    "meta-llama/Llama-2-70b-chat-hf",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "mistralai/Mistral-7B-Instruct-v0.3",
+    "garage-bAInd/Platypus2-70B-instruct",
+    "codellama/CodeLlama-70b-Instruct-hf",
+    "google/gemma-2-27b-it",
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+]
 MODEL_SUGGESTIONS = {
     "ollama": OLLAMA_MODELS,
     "llama-cpp": GGUF_MODELS,
     "mlx": MLX_MODELS,
+    "airllm": AIRLLM_MODELS,
 }
 DOWNLOAD_MODEL_OPTIONS = {
     "ollama": [(model, model, None) for model in OLLAMA_MODELS],
     "mlx": [(model.split("/")[-1], model, None) for model in MLX_MODELS],
     "llama-cpp": [(model.split("/")[-1], model, LLAMA_CPP_URLS.get(model)) for model in GGUF_MODELS],
+    "airllm": [(model.split("/")[-1], model, None) for model in AIRLLM_MODELS],
 }
 
 def extract_allowed_domains(text):
@@ -768,6 +791,8 @@ def model_matches_backend(model, backend):
     if not model:
         return False
     lowered = model.lower()
+    if backend == "airllm":
+        return "/" in model and not model.startswith("mlx-community/") and "gguf" not in lowered
     if backend == "mlx":
         return model.startswith("mlx-community/") or model.startswith(("/", ".", "~"))
     if backend == "llama-cpp":
@@ -921,7 +946,12 @@ class OCLI:
             )
         }]
         self.server_process = None
+        self.airllm_model = None
+        self.airllm_compression = None
+        self.airllm_max_length = 4096
+        self.airllm_max_new_tokens = 2048
         if self.backend == 'mlx': log_info("MLX backend selected. The model will load on the first prompt.")
+        if self.backend == 'airllm': log_info("AirLLM backend selected. The model will load on the first prompt (layer-by-layer, may take a while).")
         atexit.register(self.cleanup)
 
     def cleanup(self):
@@ -931,6 +961,10 @@ class OCLI:
             try: self.server_process.wait(timeout=5)
             except: self.server_process.kill()
             self.server_process = None
+        if self.airllm_model:
+            log_info("Unloading AirLLM model...")
+            del self.airllm_model
+            self.airllm_model = None
         self.server_model = None
 
     def menu_choice(self, title, options):
@@ -944,11 +978,16 @@ class OCLI:
     def set_backend(self, backend, url=None, keep_model=False):
         previous_backend = self.backend
         previous_url = self.url
-        next_url = url or BACKEND_DEFAULT_URLS.get(backend, "http://localhost:8080")
+        next_url = url or BACKEND_DEFAULT_URLS.get(backend) or BACKEND_DEFAULT_URLS.get("ollama")
         if previous_backend == 'mlx' and (backend != 'mlx' or next_url != previous_url):
             self.cleanup()
+        if previous_backend == 'airllm' and backend != 'airllm':
+            if self.airllm_model:
+                log_info("Unloading AirLLM model...")
+                del self.airllm_model
+                self.airllm_model = None
         self.backend = backend
-        self.url = next_url
+        self.url = next_url if backend != 'airllm' else None
         if keep_model and not model_matches_backend(self.model_name, backend):
             log_info(f"Current model {Colors.TEAL}{self.model_name}{Colors.RESET} is not compatible with {Colors.TEAL}{backend}{Colors.RESET}; using the backend default.")
             keep_model = False
@@ -958,7 +997,11 @@ class OCLI:
             log_info("MLX model will load on the first prompt.")
             if is_large_mlx_model(self.model_name):
                 log_info("Large MLX model selected; the first prompt can take several minutes while weights load into memory.")
-        log_info(f"Backend switched to {Colors.TEAL}{self.backend}{Colors.RESET} using {Colors.TEAL}{self.url}{Colors.RESET}")
+        if self.backend == 'airllm':
+            self.airllm_model = None
+            self.server_model = None
+            log_info("AirLLM model will load on the first prompt (layer-by-layer streaming).")
+        log_info(f"Backend switched to {Colors.TEAL}{self.backend}{Colors.RESET}" + (f" using {Colors.TEAL}{self.url}{Colors.RESET}" if self.url else ""))
         log_info(f"Model is now {Colors.TEAL}{self.model_name}{Colors.RESET}")
 
     def backend_menu(self):
@@ -966,13 +1009,17 @@ class OCLI:
             f"1. {Colors.CYAN}ollama{Colors.RESET}     {Colors.GRAY}Local Ollama API on port 11434{Colors.RESET}",
             f"2. {Colors.CYAN}llama-cpp{Colors.RESET}  {Colors.GRAY}OpenAI-compatible llama.cpp server{Colors.RESET}",
             f"3. {Colors.CYAN}mlx{Colors.RESET}        {Colors.GRAY}MLX server for Apple Silicon{Colors.RESET}",
+            f"4. {Colors.CYAN}airllm{Colors.RESET}     {Colors.GRAY}AirLLM in-process inference (run 70B+ on 4GB VRAM){Colors.RESET}",
         ]
         choice = self.menu_choice("BACKEND", options)
         if choice is None:
             return
-        backend = ["ollama", "llama-cpp", "mlx"][choice]
-        current_url = self.url if self.backend == backend else BACKEND_DEFAULT_URLS[backend]
-        url = self.prompt_value("Server URL", current_url)
+        backend = ["ollama", "llama-cpp", "mlx", "airllm"][choice]
+        if backend == 'airllm':
+            url = None
+        else:
+            current_url = self.url if self.backend == backend else BACKEND_DEFAULT_URLS[backend]
+            url = self.prompt_value("Server URL", current_url)
         keep_model = False
         if model_matches_backend(self.model_name, backend):
             keep = styled_input(f"  {Colors.TEAL}Keep current model '{self.model_name}'?{Colors.RESET} {Colors.GRAY}(y/N){Colors.RESET}: ").strip().lower()
@@ -1021,31 +1068,106 @@ class OCLI:
                 log_info("Large MLX model selected; the first prompt can take several minutes while weights load into memory.")
         log_info(f"Model switched to {Colors.TEAL}{self.model_name}{Colors.RESET}")
 
-    def run_model_download(self, model_name, url=None):
+    def parse_download_args(self, arg_text):
+        if not arg_text:
+            return None, None
+        try:
+            parts = shlex.split(arg_text)
+        except ValueError as e:
+            log_info(f"Could not parse download arguments: {e}")
+            return arg_text.strip(), None
+
+        path = None
+        model_parts = []
+        i = 0
+        while i < len(parts):
+            part = parts[i]
+            if part in ["--path", "--dir", "--local-dir", "-p"]:
+                if i + 1 >= len(parts):
+                    log_info(f"Missing path after {part}.")
+                    break
+                path = parts[i + 1]
+                i += 2
+                continue
+            if part.startswith("--path=") or part.startswith("--dir=") or part.startswith("--local-dir="):
+                path = part.split("=", 1)[1]
+                i += 1
+                continue
+            model_parts.append(part)
+            i += 1
+        return " ".join(model_parts).strip() or None, path
+
+    def model_download_default_dir(self, model_name=None, url=None):
+        if self.backend == "mlx":
+            name = (model_name or "model").rstrip("/").split("/")[-1] or "model"
+            return os.path.join("models", "mlx", name)
+        if self.backend == "airllm":
+            name = (model_name or "model").rstrip("/").split("/")[-1] or "model"
+            return os.path.join("models", "airllm", name)
+        if self.backend == "llama-cpp":
+            if model_name and "/" in model_name and not url:
+                name = model_name.rstrip("/").split("/")[-1] or "model"
+                return os.path.join("llama.cpp", "models", name)
+            return os.path.join("llama.cpp", "models")
+        return ""
+
+    def normalize_download_dir(self, path):
+        return os.path.abspath(os.path.expanduser(path)) if path else None
+
+    def prompt_download_dir(self, model_name=None, url=None):
+        if self.backend == "ollama":
+            log_info("Ollama stores models in its configured model directory; set OLLAMA_MODELS before starting Ollama to change it.")
+            return None
+        default = self.model_download_default_dir(model_name, url)
+        path = self.prompt_value("Download path", default)
+        return self.normalize_download_dir(path)
+
+    def run_model_download(self, model_name, url=None, download_dir=None, ask_for_path=True):
         if not model_name:
             return
         log_info(f"Download target: {Colors.TEAL}{model_name}{Colors.RESET}")
         if self.backend == "ollama":
+            if download_dir:
+                log_info("Ollama does not support a per-download path; using the active Ollama model store.")
             self.run_cmd(f"ollama pull {shlex.quote(model_name)}")
         elif self.backend == "mlx":
-            self.download_mlx_model(model_name)
-        else:
+            if ask_for_path and not download_dir:
+                download_dir = self.prompt_download_dir(model_name, url)
+            result = self.download_mlx_model(model_name, download_dir)
+            if download_dir:
+                log_info(f"To use this local MLX model, run {Colors.TEAL}/model {self.normalize_download_dir(download_dir)}{Colors.RESET}")
+            return result
+        elif self.backend == "airllm":
+            if ask_for_path and not download_dir:
+                download_dir = self.prompt_download_dir(model_name, url)
+            download_dir = self.normalize_download_dir(download_dir)
+            if download_dir:
+                os.makedirs(download_dir, exist_ok=True)
+                result = self.run_cmd(f"hf download {shlex.quote(model_name)} --local-dir {shlex.quote(download_dir)}")
+                log_info(f"To use this local AirLLM model, run {Colors.TEAL}/model {download_dir}{Colors.RESET}")
+                return result
+            return self.run_cmd(f"hf download {shlex.quote(model_name)}")
+        elif self.backend == "llama-cpp":
+            if ask_for_path and not download_dir:
+                download_dir = self.prompt_download_dir(model_name, url)
+            download_dir = self.normalize_download_dir(download_dir or self.model_download_default_dir(model_name, url))
             if not url and "/" in model_name:
-                target = os.path.join("llama.cpp/models", model_name.split("/")[-1])
-                os.makedirs(target, exist_ok=True)
-                self.run_cmd(f"hf download {shlex.quote(model_name)} --include '*.gguf' --local-dir {shlex.quote(target)}")
+                os.makedirs(download_dir, exist_ok=True)
+                self.run_cmd(f"hf download {shlex.quote(model_name)} --include '*.gguf' --local-dir {shlex.quote(download_dir)}")
                 return
             url = url or self.prompt_value("GGUF download URL")
             if not url:
                 log_info("Download canceled.")
                 return
-            os.makedirs("llama.cpp/models", exist_ok=True)
+            os.makedirs(download_dir, exist_ok=True)
             filename = model_name if model_name.endswith(".gguf") else os.path.basename(url.split("?")[0]) or f"{model_name}.gguf"
-            self.run_cmd(f"curl -L -o {shlex.quote(os.path.join('llama.cpp/models', filename))} {shlex.quote(url)}")
+            self.run_cmd(f"curl -L -o {shlex.quote(os.path.join(download_dir, filename))} {shlex.quote(url)}")
+        else:
+            log_info(f"Model download is not configured for backend {Colors.TEAL}{self.backend}{Colors.RESET}.")
 
-    def download_model_menu(self, model_name=None):
+    def download_model_menu(self, model_name=None, download_dir=None):
         if model_name:
-            self.run_model_download(model_name)
+            self.run_model_download(model_name, download_dir=download_dir)
             return
         choices = DOWNLOAD_MODEL_OPTIONS.get(self.backend, [])
         options = [
@@ -1058,7 +1180,7 @@ class OCLI:
             return
         if choice < len(choices):
             _, value, url = choices[choice]
-            self.run_model_download(value, url)
+            self.run_model_download(value, url, download_dir=download_dir)
             return
         if self.backend == "llama-cpp":
             url = self.prompt_value("GGUF download URL")
@@ -1066,10 +1188,10 @@ class OCLI:
                 log_info("Download canceled.")
                 return
             model_name = self.prompt_value("Save as", os.path.basename(url.split("?")[0]) or "model.gguf")
-            self.run_model_download(model_name, url)
+            self.run_model_download(model_name, url, download_dir=download_dir)
             return
         model_name = self.prompt_value("Model to download", self.model_name)
-        self.run_model_download(model_name)
+        self.run_model_download(model_name, download_dir=download_dir)
 
     def is_port_open(self, host, port):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1227,10 +1349,15 @@ class OCLI:
             interrupter.stop_listening()
             return f"Error: {str(e)}"
 
-    def download_mlx_model(self, repo_id):
+    def download_mlx_model(self, repo_id, download_dir=None):
         try:
             log_tool(f"Downloading MLX Model: {repo_id}")
-            cmd = f"hf download {shlex.quote(repo_id)}"
+            download_dir = self.normalize_download_dir(download_dir)
+            if download_dir:
+                os.makedirs(download_dir, exist_ok=True)
+                cmd = f"hf download {shlex.quote(repo_id)} --local-dir {shlex.quote(download_dir)}"
+            else:
+                cmd = f"hf download {shlex.quote(repo_id)}"
             return self.run_cmd(cmd)
         except Exception as e: return f"Error: {str(e)}"
 
@@ -1445,13 +1572,17 @@ class OCLI:
         self.run_cmd(build_cmd)
 
         log_info("Setting up models directory and downloading a starter model...")
-        model_setup = "mkdir -p llama.cpp/models && curl -L -o llama.cpp/models/qwen2.5-coder-1.5b.gguf 'https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf'"
+        starter_filename = "qwen2.5-coder-1.5b.gguf"
+        starter_dir = self.normalize_download_dir(self.prompt_value("Starter model download path", os.path.join("llama.cpp", "models")))
+        starter_path = os.path.join(starter_dir, starter_filename)
+        starter_url = "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+        model_setup = f"mkdir -p {shlex.quote(starter_dir)} && curl -L -o {shlex.quote(starter_path)} {shlex.quote(starter_url)}"
         self.run_cmd(model_setup)
 
         log_info("llama.cpp setup complete!")
         print(f"\n  {status_label('SUCCESS', Colors.GREEN)} llama.cpp is ready!")
-        print(f"  {Colors.CYAN}To start the server:{Colors.RESET} cd llama.cpp && ./build/bin/llama-server -m models/qwen2.5-coder-1.5b.gguf")
-        print(f"  {Colors.CYAN}To use with OCLI:{Colors.RESET} python3 OCLI.py --backend llama-cpp --model qwen2.5-coder-1.5b")
+        print(f"  {Colors.CYAN}To start the server:{Colors.RESET} cd llama.cpp && ./build/bin/llama-server -m {starter_path}")
+        print(f"  {Colors.CYAN}To use with OCLI:{Colors.RESET} python3 OCLI.py --backend llama-cpp --model {starter_path}")
         return "llama.cpp setup successful."
 
     def setup_mlx(self):
@@ -1464,15 +1595,17 @@ class OCLI:
 
         log_info("Downloading recommended MLX model (Qwen2.5-Coder-7B-Instruct)...")
         model_name = "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+        model_dir = self.normalize_download_dir(self.prompt_value("Recommended model download path", os.path.join("models", "mlx", model_name.split("/")[-1])))
         try:
-            self.run_cmd(f"{sys.executable} -m huggingface_hub.commands.cli download {model_name}")
+            os.makedirs(model_dir, exist_ok=True)
+            self.run_cmd(f"{shlex.quote(sys.executable)} -m huggingface_hub.commands.cli download {shlex.quote(model_name)} --local-dir {shlex.quote(model_dir)}")
         except Exception as e:
             log_info(f"Model download check failed: {e}")
 
         log_info("MLX setup complete!")
         print(f"\n  {status_label('SUCCESS', Colors.GREEN)} MLX (mlx-lm) is ready!")
-        print(f"  {Colors.CYAN}To start the server:{Colors.RESET} python3 -m mlx_lm.server --model {model_name}")
-        print(f"  {Colors.CYAN}To use with OCLI:{Colors.RESET} python3 OCLI.py --backend mlx --model {model_name}")
+        print(f"  {Colors.CYAN}To start the server:{Colors.RESET} python3 -m mlx_lm.server --model {model_dir}")
+        print(f"  {Colors.CYAN}To use with OCLI:{Colors.RESET} python3 OCLI.py --backend mlx --model {model_dir}")
         return "MLX setup successful."
 
     def save_session(self, path=None):
@@ -1557,6 +1690,29 @@ class OCLI:
         if self.backend == 'ollama':
             response = ollama.chat(model=self.model_name, messages=[{'role': 'user', 'content': prompt}])
             return response['message']['content'].strip()
+        elif self.backend == 'airllm':
+            if not self.airllm_model:
+                return self.fallback_compaction_summary(messages)
+            try:
+                import torch
+                prompt_text = self.airllm_model.tokenizer.apply_chat_template([{'role': 'user', 'content': prompt}], tokenize=False, add_generation_prompt=True)
+                if not prompt_text:
+                    prompt_text = f"user: {prompt}\nassistant: "
+                input_tokens = self.airllm_model.tokenizer(
+                    [prompt_text], return_tensors="pt", return_attention_mask=False, 
+                    truncation=True, max_length=self.airllm_max_length, padding=False
+                )
+                input_ids = input_tokens['input_ids']
+                if torch.cuda.is_available():
+                    input_ids = input_ids.cuda()
+                generation_output = self.airllm_model.generate(
+                    input_ids, max_new_tokens=1024, use_cache=True, return_dict_in_generate=True
+                )
+                output_ids = generation_output.sequences[0][len(input_ids[0]):]
+                return self.airllm_model.tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+            except Exception as e:
+                log_info(f"AirLLM compaction failed: {e}")
+                return self.fallback_compaction_summary(messages)
         response = requests.post(
             f"{self.url}/v1/chat/completions",
             json={"model": self.model_name, "messages": [{'role': 'user', 'content': prompt}], "temperature": 0.1},
@@ -1687,14 +1843,14 @@ class OCLI:
                             f"{Colors.CYAN}/help{Colors.RESET}         {Colors.GRAY}Show this command deck{Colors.RESET}",
                             f"{Colors.CYAN}/backend{Colors.RESET}      {Colors.GRAY}Open the backend switcher{Colors.RESET}",
                             f"{Colors.CYAN}/model{Colors.RESET}        {Colors.GRAY}Open the model switcher{Colors.RESET}",
-                            f"{Colors.CYAN}/download_model{Colors.RESET} {Colors.GRAY}Download a model for the active backend{Colors.RESET}",
+                            f"{Colors.CYAN}/download_model [m] [--path dir]{Colors.RESET} {Colors.GRAY}Download a model for the active backend{Colors.RESET}",
                             f"{Colors.CYAN}/auto{Colors.RESET}         {Colors.GRAY}Toggle auto-execution mode{Colors.RESET}",
                             f"{Colors.CYAN}/plan{Colors.RESET}         {Colors.GRAY}Toggle autonomous planning mode{Colors.RESET}",
                             f"{Colors.CYAN}/tasks{Colors.RESET}        {Colors.GRAY}Show progress checkpoints{Colors.RESET}",
                             f"{Colors.CYAN}/save [file]{Colors.RESET}  {Colors.GRAY}Save current session to JSON{Colors.RESET}",
                             f"{Colors.CYAN}/load <file>{Colors.RESET}  {Colors.GRAY}Load a session from JSON{Colors.RESET}",
                             f"{Colors.CYAN}/setup_mlx{Colors.RESET}    {Colors.GRAY}Install and download MLX models{Colors.RESET}",
-                            f"{Colors.CYAN}/download <r>{Colors.RESET} {Colors.GRAY}Download an MLX model from Hugging Face{Colors.RESET}",
+                            f"{Colors.CYAN}/download <r> [--path dir]{Colors.RESET} {Colors.GRAY}Download an MLX model from Hugging Face{Colors.RESET}",
                             f"{Colors.CYAN}/exit{Colors.RESET}         {Colors.GRAY}Quit OCLI{Colors.RESET}",
                             "",
                             f"{Colors.GRAY}Tools like read_url and web_search are used automatically during exploration.{Colors.RESET}"
@@ -1707,13 +1863,17 @@ class OCLI:
                         self.setup_mlx()
                         continue
                     elif cmd == '/download':
-                        if len(cmd_parts) < 2:
-                            log_info("Usage: /download <repo_id>")
+                        repo_id, download_dir = self.parse_download_args(user_input[len(cmd_parts[0]):].strip())
+                        if not repo_id:
+                            log_info("Usage: /download <repo_id> [--path <download_dir>]")
                             continue
-                        self.download_mlx_model(cmd_parts[1])
+                        if download_dir is None:
+                            download_dir = self.prompt_download_dir(repo_id)
+                        self.download_mlx_model(repo_id, download_dir)
                         continue
                     elif cmd == '/download_model':
-                        self.download_model_menu(" ".join(cmd_parts[1:]) if len(cmd_parts) > 1 else None)
+                        model_arg, download_dir = self.parse_download_args(user_input[len(cmd_parts[0]):].strip())
+                        self.download_model_menu(model_arg, download_dir)
                         continue
                     else:
                         log_info(f"Unknown command: {cmd}")
@@ -1761,7 +1921,7 @@ class OCLI:
                     {'type': 'function', 'function': {'name': 'run_cmd', 'description': 'Run shell command', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}}},
                     {'type': 'function', 'function': {'name': 'web_search', 'description': 'Search web via DuckDuckGo. Use authoritative domains for official-source searches.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}, 'num_results': {'type': 'integer', 'default': 10}}, 'required': ['query']}}},
                     {'type': 'function', 'function': {'name': 'read_url', 'description': 'Fetch and read the text content of a URL.', 'parameters': {'type': 'object', 'properties': {'url': {'type': 'string'}}, 'required': ['url']}}},
-                    {'type': 'function', 'function': {'name': 'download_mlx_model', 'description': 'Download an MLX model from Hugging Face.', 'parameters': {'type': 'object', 'properties': {'repo_id': {'type': 'string'}}, 'required': ['repo_id']}}},
+                    {'type': 'function', 'function': {'name': 'download_mlx_model', 'description': 'Download an MLX model from Hugging Face.', 'parameters': {'type': 'object', 'properties': {'repo_id': {'type': 'string'}, 'download_dir': {'type': 'string', 'description': 'Optional local directory for the downloaded model files.'}}, 'required': ['repo_id']}}},
                     {'type': 'function', 'function': {'name': 'read_file', 'description': 'Read file', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path']}}},
                     {'type': 'function', 'function': {'name': 'write_file', 'description': 'Write file', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}, 'content': {'type': 'string'}}, 'required': ['path', 'content']}}},
                     {'type': 'function', 'function': {'name': 'test_cmd', 'description': 'Run command with live feedback (use for interactive tests or long processes).', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}}},
@@ -1827,6 +1987,63 @@ class OCLI:
                         if 'content' in msg: process_token(msg['content'])
                         if 'tool_calls' in msg and msg['tool_calls']: tool_calls.extend(normalize_tool_call(tc) for tc in msg['tool_calls'])
                         if 'total_duration' in chunk: response_metadata = chunk
+                elif self.backend == 'airllm':
+                    try:
+                        from airllm import AutoModel
+                        import torch
+                    except ImportError:
+                        spinner.stop()
+                        interrupter.stop_listening()
+                        log_info(f"AirLLM or PyTorch is not installed. Please run: {Colors.TEAL}pip install airllm torch{Colors.RESET}")
+                        self.messages.append({'role': 'assistant', 'content': "[AirLLM NOT INSTALLED]"})
+                        return False
+                    
+                    if not self.airllm_model:
+                        log_info(f"Loading AirLLM model {self.model_name}...")
+                        try:
+                            self.airllm_model = AutoModel.from_pretrained(self.model_name, compression=self.airllm_compression)
+                            self.server_model = self.model_name
+                        except Exception as e:
+                            spinner.stop()
+                            interrupter.stop_listening()
+                            log_info(f"Failed to load AirLLM model: {e}")
+                            self.messages.append({'role': 'assistant', 'content': f"[MODEL LOAD ERROR] {e}"})
+                            return False
+                    
+                    try:
+                        prompt_text = self.airllm_model.tokenizer.apply_chat_template(self.server_messages(), tokenize=False, add_generation_prompt=True)
+                        if not prompt_text:
+                            prompt_text = "\n".join([f"{m['role']}: {m['content']}" for m in self.server_messages()]) + "\nassistant: "
+                        
+                        input_tokens = self.airllm_model.tokenizer(
+                            [prompt_text],
+                            return_tensors="pt",
+                            return_attention_mask=False,
+                            truncation=True,
+                            max_length=self.airllm_max_length,
+                            padding=False
+                        )
+                        
+                        input_ids = input_tokens['input_ids']
+                        if torch.cuda.is_available():
+                            input_ids = input_ids.cuda()
+                            
+                        generation_output = self.airllm_model.generate(
+                            input_ids,
+                            max_new_tokens=self.airllm_max_new_tokens,
+                            use_cache=True,
+                            return_dict_in_generate=True
+                        )
+                        
+                        output_ids = generation_output.sequences[0][len(input_ids[0]):]
+                        output_text = self.airllm_model.tokenizer.decode(output_ids, skip_special_tokens=True)
+                        process_token(output_text)
+                    except Exception as e:
+                        spinner.stop()
+                        interrupter.stop_listening()
+                        log_info(f"AirLLM generation failed: {e}")
+                        self.messages.append({'role': 'assistant', 'content': f"[AIRLLM ERROR] {e}"})
+                        return False
                 else:
                     payload = {"model": self.model_name, "messages": self.server_messages(), "stream": True}
                     try:
@@ -2099,7 +2316,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str)
     parser.add_argument("--auto", action="store_true")
-    parser.add_argument("--backend", type=str, choices=['ollama', 'llama-cpp', 'mlx'], default="ollama")
+    parser.add_argument("--backend", type=str, choices=['ollama', 'llama-cpp', 'mlx', 'airllm'], default="ollama")
     parser.add_argument("--url", type=str, help="Server URL (e.g. http://localhost:8080)")
     parser.add_argument("--skip-install", action="store_true", help="Skip automatic OCLI launcher installation")
     args = parser.parse_args()
