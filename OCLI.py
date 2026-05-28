@@ -647,6 +647,7 @@ def print_logo():
         "██║   ██║██╔══██║██║     ██║     ██║╚██╗ ██╔╝██║██║   ██║██║╚██╔╝██║",
         "╚██████╔╝██║  ██║███████╗███████╗██║ ╚████╔╝ ██║╚██████╔╝██║ ╚═╝ ██║",
         " ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═══╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝",
+        "                                                    Coding Assistant",
     ]
     cols = term_cols()
     art_width = max(len(line) for line in art_lines)
@@ -666,6 +667,21 @@ MAX_URL_OUTPUT_LENGTH = 1500000
 HISTORY_THRESHOLD = 36
 COMPACT_RECENT_MESSAGES = 12
 COMPACT_MAX_MESSAGE_CHARS = 2200
+COMPACT_TOKEN_BUDGET = 16000
+COMPACT_RECENT_TOOL_CHARS = 4000
+COMPACT_RECENT_TEXT_CHARS = 8000
+COMPACT_SUMMARY_MAX_TOKENS = 700
+
+def estimate_tokens(text):
+    return max(1, len(str(text or "")) // 4)
+
+def head_tail_trim(text, limit, marker=" ... [trimmed] ... "):
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    head = max(1, (limit * 2) // 3)
+    tail = max(1, limit - head)
+    return text[:head] + marker + text[-tail:]
 DANGEROUS_PATTERNS = [r'\brm\b', r'\bmv\b', r'\bsudo\b', r'\bchmod\b', r'\bchown\b', r'\bdd\b', r'\bmkfs\b', r'\bformat\b', r'\bkill\b', r'>\s*/dev/', r'\bshred\b', r'\bwipe\b']
 ALLOWED_SEARCH_DOMAINS = ["ollama.com", "googleblog.com", "ai.google.dev", "huggingface.co"]
 CLI_COMMAND_NAME = "OCLI"
@@ -1121,6 +1137,7 @@ class OCLI:
         self.repeated_failure_count = 0
         self.tool_steps_this_turn = 0
         self.compaction_count = 0
+        self.last_summary = ""
         self.server_model = None
         self.tool_access = "full"
         self.allow_spawn_agents = True
@@ -1975,18 +1992,41 @@ class OCLI:
                 calls.append(f"{fn.get('name', 'unknown')}({fn.get('arguments', {})})")
             content = (content + "\nTool calls: " + "; ".join(calls)).strip()
         content = re.sub(r"\s+", " ", content).strip()
-        if len(content) > COMPACT_MAX_MESSAGE_CHARS:
-            content = content[:COMPACT_MAX_MESSAGE_CHARS] + " ... [trimmed]"
+        content = head_tail_trim(content, COMPACT_MAX_MESSAGE_CHARS)
         return f"{header}: {content}" if content else f"{header}: [empty]"
 
     def compact_source_text(self, messages):
-        return "\n".join(self.compact_message_text(message) for message in messages)
+        skippable = lambda m: str(m.get('content', '') or "").startswith("Working memory summary #")
+        return "\n".join(self.compact_message_text(message) for message in messages if not skippable(message))
 
     def recent_context_slice(self):
-        recent = self.messages[-COMPACT_RECENT_MESSAGES:]
+        body = self.messages[1:]
+        recent = body[-COMPACT_RECENT_MESSAGES:]
         while recent and recent[0].get('role') == 'tool':
             recent = recent[1:]
         return recent
+
+    def trim_recent_context(self, messages):
+        trimmed = []
+        for message in messages:
+            content = str(message.get('content', '') or "")
+            limit = COMPACT_RECENT_TOOL_CHARS if message.get('role') == 'tool' else COMPACT_RECENT_TEXT_CHARS
+            if len(content) > limit:
+                clone = dict(message)
+                clone['content'] = head_tail_trim(content, limit)
+                trimmed.append(clone)
+            else:
+                trimmed.append(message)
+        return trimmed
+
+    def estimate_context_tokens(self):
+        total = 0
+        for message in self.messages:
+            total += len(str(message.get('content', '') or ""))
+            for call in (message.get('tool_calls') or []):
+                fn = call.get('function', {}) if isinstance(call, dict) else {}
+                total += len(str(fn.get('arguments', '')))
+        return total // 4
 
     def fallback_compaction_summary(self, messages):
         users = [m.get('content', '') for m in messages if m.get('role') == 'user']
@@ -2002,18 +2042,30 @@ class OCLI:
             f"Next Steps: Inspect current context, continue the user's latest request, and verify changes."
         )
 
-    def request_compaction_summary(self, messages):
+    def request_compaction_summary(self, messages, prior_summary=""):
         source = self.compact_source_text(messages)
+        base = ""
+        if prior_summary:
+            base = (
+                "Existing working-memory summary to refine and extend. Keep every still-relevant fact, "
+                "fold in the new events, and drop only what is now obsolete:\n"
+                f"{prior_summary}\n\n"
+            )
         prompt = (
             "Create a compact working-memory summary for an autonomous coding CLI. "
             "Preserve only durable facts needed to continue accurately. "
             "Include these labels exactly: Goal, State, Files, Commands, Decisions, Failures, Next Steps. "
             "Mention concrete filenames, commands, test results, backend/model changes, and unresolved risks when present. "
             "Do not include hidden reasoning or generic narration.\n\n"
-            f"Conversation to compact:\n{source}"
+            f"{base}"
+            f"New conversation events to fold in:\n{source}"
         )
         if self.backend == 'ollama':
-            response = ollama.chat(model=self.model_name, messages=[{'role': 'user', 'content': prompt}])
+            response = ollama.chat(
+                model=self.model_name,
+                messages=[{'role': 'user', 'content': prompt}],
+                options={'temperature': 0.1, 'num_predict': COMPACT_SUMMARY_MAX_TOKENS},
+            )
             return response['message']['content'].strip()
         elif self.backend == 'airllm':
             if not self.airllm_model:
@@ -2024,14 +2076,14 @@ class OCLI:
                 if not prompt_text:
                     prompt_text = f"user: {prompt}\nassistant: "
                 input_tokens = self.airllm_model.tokenizer(
-                    [prompt_text], return_tensors="pt", return_attention_mask=False, 
+                    [prompt_text], return_tensors="pt", return_attention_mask=False,
                     truncation=True, max_length=self.airllm_max_length, padding=False
                 )
                 input_ids = input_tokens['input_ids']
                 if torch.cuda.is_available():
                     input_ids = input_ids.cuda()
                 generation_output = self.airllm_model.generate(
-                    input_ids, max_new_tokens=1024, use_cache=True, return_dict_in_generate=True
+                    input_ids, max_new_tokens=COMPACT_SUMMARY_MAX_TOKENS, use_cache=True, return_dict_in_generate=True
                 )
                 output_ids = generation_output.sequences[0][len(input_ids[0]):]
                 return self.airllm_model.tokenizer.decode(output_ids, skip_special_tokens=True).strip()
@@ -2040,34 +2092,42 @@ class OCLI:
                 return self.fallback_compaction_summary(messages)
         response = requests.post(
             f"{self.url}/v1/chat/completions",
-            json={"model": self.model_name, "messages": [{'role': 'user', 'content': prompt}], "temperature": 0.1},
+            json={"model": self.model_name, "messages": [{'role': 'user', 'content': prompt}], "temperature": 0.1, "max_tokens": COMPACT_SUMMARY_MAX_TOKENS},
             timeout=60
         )
         response.raise_for_status()
         return response.json()['choices'][0]['message']['content'].strip()
 
     def compact_history(self):
-        if len(self.messages) > HISTORY_THRESHOLD:
-            log_info("History threshold reached. Compacting...")
-            system_msg = self.messages[0]
-            recent_context = self.recent_context_slice()
-            middle_end = len(self.messages) - len(recent_context)
-            middle_messages = self.messages[1:middle_end]
-            try:
-                summary = self.request_compaction_summary(middle_messages)
-            except Exception as e:
-                log_info(f"Compaction model failed ({e}). Using local summary.")
-                summary = self.fallback_compaction_summary(middle_messages)
-            self.compaction_count += 1
-            memory = (
-                f"Working memory summary #{self.compaction_count}:\n{summary}\n\n"
-                f"Current backend: {self.backend}\n"
-                f"Current model: {self.model_name}\n"
-                f"Auto mode: {'ON' if self.auto_mode else 'OFF'}\n"
-                f"Planning: {'ENABLED' if self.planning_enabled else 'DISABLED'}"
-            )
-            self.messages = [system_msg, {'role': 'assistant', 'content': memory}] + recent_context
-            log_info(f"Compaction successful. Preserved {len(recent_context)} recent messages.")
+        estimated = self.estimate_context_tokens()
+        if len(self.messages) <= HISTORY_THRESHOLD and estimated <= COMPACT_TOKEN_BUDGET:
+            return
+        reason = "token budget" if estimated > COMPACT_TOKEN_BUDGET else "message count"
+        log_info(f"Compacting history (~{estimated} tokens, {len(self.messages)} messages, trigger: {reason})...")
+        system_msg = self.messages[0]
+        recent_context = self.trim_recent_context(self.recent_context_slice())
+        middle_end = len(self.messages) - len(recent_context)
+        middle_messages = self.messages[1:middle_end]
+        if not middle_messages:
+            self.messages = [system_msg] + recent_context
+            log_info(f"Trimmed oversized recent context. Preserved {len(recent_context)} messages.")
+            return
+        try:
+            summary = self.request_compaction_summary(middle_messages, self.last_summary)
+        except Exception as e:
+            log_info(f"Compaction model failed ({e}). Using local summary.")
+            summary = self.fallback_compaction_summary(middle_messages)
+        self.compaction_count += 1
+        self.last_summary = summary
+        memory = (
+            f"Working memory summary #{self.compaction_count}:\n{summary}\n\n"
+            f"Current backend: {self.backend}\n"
+            f"Current model: {self.model_name}\n"
+            f"Auto mode: {'ON' if self.auto_mode else 'OFF'}\n"
+            f"Planning: {'ENABLED' if self.planning_enabled else 'DISABLED'}"
+        )
+        self.messages = [system_msg, {'role': 'assistant', 'content': memory}] + recent_context
+        log_info(f"Compaction #{self.compaction_count} done (~{self.estimate_context_tokens()} tokens, preserved {len(recent_context)} recent messages).")
 
     def server_messages(self):
         prepared = []
