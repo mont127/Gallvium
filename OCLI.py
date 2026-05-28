@@ -9,6 +9,9 @@ import time
 import re
 import random
 import threading
+import concurrent.futures
+import contextlib
+import io
 import select
 import termios
 import tty
@@ -46,12 +49,28 @@ class Colors:
     PINK = "\033[38;5;213m"
     ORANGE = "\033[38;5;208m"
     LIME = "\033[38;5;118m"
+    SKY = "\033[38;5;117m"
+    EMERALD = "\033[38;5;78m"
+    AMBER = "\033[38;5;220m"
+    ROSE = "\033[38;5;204m"
+    SLATE = "\033[38;5;245m"
+    INDIGO = "\033[38;5;105m"
+    MINT = "\033[38;5;121m"
     BG_DARK = "\033[48;5;236m"
+    BG_PANEL = "\033[48;5;234m"
+    BG_BADGE = "\033[48;5;238m"
+    BG_ACCENT = "\033[48;5;54m"
     BOLD = "\033[1m"
     DIM = "\033[2m"
     ITALIC = "\033[3m"
     UNDERLINE = "\033[4m"
     RESET = "\033[0m"
+
+ACCENT = Colors.TEAL
+MUTED = Colors.SLATE
+
+def badge(text, fg=Colors.WHITE, bg=Colors.BG_BADGE):
+    return f"{bg}{fg}{Colors.BOLD} {text} {Colors.RESET}"
 
 def clean_ansi(text):
     return re.sub(r"\033\[[0-9;]*m", "", str(text))
@@ -59,44 +78,80 @@ def clean_ansi(text):
 def clean_len(text):
     return len(clean_ansi(text))
 
-def term_width(default=92):
+def term_cols(default=100):
     try:
-        return max(64, min(104, os.get_terminal_size().columns - 4))
+        return os.get_terminal_size().columns
     except OSError:
         return default
 
-def frame_title(title, style=Colors.CYAN):
+LEFT_MARGIN = 2
+
+def term_width(default=92):
+    cols = term_cols(default + LEFT_MARGIN * 2)
+    return max(60, cols - LEFT_MARGIN * 2)
+
+def left_indent():
+    return " " * LEFT_MARGIN
+
+def center_pad(content_len):
+    cols = term_cols()
+    return " " * max(LEFT_MARGIN, (cols - content_len) // 2)
+
+def frame_title(title, style=None, subtitle=None):
+    style = style or MUTED
     width = term_width()
-    label = f" {title} "
-    line = "─" * max(2, width - clean_len(label) - 2)
-    return f"{style}{Colors.BOLD}╭{label}{line}╮{Colors.RESET}"
+    label = f" {Colors.RESET}{Colors.BOLD}{Colors.WHITE}{title}{Colors.RESET}{style} "
+    label_len = clean_len(f" {title} ")
+    sub_len = 0
+    sub = ""
+    if subtitle:
+        sub = f"{Colors.RESET}{Colors.DIM}{Colors.GRAY}{subtitle}{Colors.RESET}{style} "
+        sub_len = clean_len(f"{subtitle} ")
+    line = "─" * max(2, width - label_len - sub_len - 4)
+    return f"{style}╭─{label}{sub}{line}─╮{Colors.RESET}"
 
-def frame_bottom(style=Colors.CYAN):
+def frame_bottom(style=None, hint=None):
+    style = style or MUTED
     width = term_width()
-    return f"{style}{Colors.BOLD}╰{'─' * (width - 2)}╯{Colors.RESET}"
+    if hint:
+        hint_text = f" {Colors.RESET}{Colors.DIM}{Colors.GRAY}{hint}{Colors.RESET}{style} "
+        hint_len = clean_len(f" {hint} ")
+        line = "─" * max(2, width - hint_len - 4)
+        return f"{style}╰─{line}{hint_text}─╯{Colors.RESET}"
+    return f"{style}╰{'─' * (width - 2)}╯{Colors.RESET}"
 
-def status_label(text, style=Colors.CYAN):
-    return f"{style}{Colors.BOLD}▸ {text}{Colors.RESET}"
+def status_label(text, style=None):
+    style = style or ACCENT
+    return f"{style}{Colors.BOLD}▎{Colors.RESET}{Colors.BOLD}{Colors.WHITE} {text} {Colors.RESET}"
 
-def mode_value(enabled, on="ON", off="OFF"):
-    return f"{Colors.GREEN}{on}{Colors.RESET}" if enabled else f"{Colors.RED}{off}{Colors.RESET}"
+def mode_value(enabled, on="on", off="off"):
+    if enabled:
+        return f"{ACCENT}●{Colors.RESET} {Colors.WHITE}{on}{Colors.RESET}"
+    return f"{Colors.DIM}{Colors.GRAY}○ {off}{Colors.RESET}"
 
-def soft_rule(style=Colors.GRAY):
-    return f"  {style}{Colors.DIM}{'─' * min(term_width(), 78)}{Colors.RESET}"
+def soft_rule(style=None):
+    style = style or Colors.GRAY
+    return f"{left_indent()}{style}{Colors.DIM}{'─' * term_width()}{Colors.RESET}"
+
+def kv_row(label, value, label_width=11):
+    pad = max(0, label_width - clean_len(label))
+    return f"{Colors.DIM}{Colors.GRAY}{label}{Colors.RESET}{' ' * pad}  {value}"
 
 def print_panel(title, lines, style=Colors.CYAN):
     width = term_width()
     inner_width = width - 4
-    print(f"  {frame_title(title, style)}")
+    indent = left_indent()
+    print(f"{indent}{frame_title(title, style)}")
     for line in lines:
         chunks = str(line).splitlines() or [""]
         for chunk in chunks:
             pad = " " * max(0, inner_width - clean_len(chunk))
-            print(f"  {style}{Colors.BOLD}│{Colors.RESET} {chunk}{pad} {style}{Colors.BOLD}│{Colors.RESET}")
-    print(f"  {frame_bottom(style)}")
+            print(f"{indent}{style}{Colors.BOLD}│{Colors.RESET} {chunk}{pad} {style}{Colors.BOLD}│{Colors.RESET}")
+    print(f"{indent}{frame_bottom(style)}")
 
 def print_frame_line(text="", style=Colors.MAGENTA):
     inner_width = term_width() - 4
+    indent = left_indent()
     safe = clean_ansi(str(text)).replace("\r", "\n").replace("\t", "    ")
     safe = "".join(char if char == "\n" or ord(char) >= 32 else " " for char in safe)
     lines = safe.split("\n")
@@ -104,13 +159,13 @@ def print_frame_line(text="", style=Colors.MAGENTA):
         lines = [""]
     for line in lines:
         if line == "":
-            print(f"  {style}{Colors.BOLD}│{Colors.RESET} {' ' * inner_width} {style}{Colors.BOLD}│{Colors.RESET}")
+            print(f"{indent}{style}{Colors.BOLD}│{Colors.RESET} {' ' * inner_width} {style}{Colors.BOLD}│{Colors.RESET}")
             continue
         while line:
             chunk = line[:inner_width]
             line = line[inner_width:]
             pad = " " * max(0, inner_width - clean_len(chunk))
-            print(f"  {style}{Colors.BOLD}│{Colors.RESET} {chunk}{pad} {style}{Colors.BOLD}│{Colors.RESET}")
+            print(f"{indent}{style}{Colors.BOLD}│{Colors.RESET} {chunk}{pad} {style}{Colors.BOLD}│{Colors.RESET}")
 
 def print_frame_text(text, style=Colors.MAGENTA):
     normalized = str(text).replace("\r", "\n")
@@ -294,21 +349,22 @@ def menu_lines(title, options, selected, style=Colors.VIOLET, offset=0, limit=No
     width = term_width()
     inner_width = width - 4
     visible = options[offset:offset + limit] if limit else options
-    lines = [f"  {frame_title(title, style)}"]
+    indent = left_indent()
+    lines = [f"{indent}{frame_title(title, style)}"]
     for visible_index, option in enumerate(visible):
         actual_index = offset + visible_index
-        marker = "▶" if actual_index == selected else " "
         if actual_index == selected:
-            entry = f"{Colors.BG_DARK}{Colors.WHITE}{Colors.BOLD}{marker} {option}{Colors.RESET}"
+            entry = f"{ACCENT}{Colors.BOLD}❯{Colors.RESET} {Colors.WHITE}{Colors.BOLD}{option}{Colors.RESET}"
         else:
-            entry = f"{Colors.GRAY}{marker}{Colors.RESET} {option}"
+            entry = f"{Colors.DIM}{Colors.GRAY}  {option}{Colors.RESET}"
         pad = " " * max(0, inner_width - clean_len(entry))
-        lines.append(f"  {style}{Colors.BOLD}│{Colors.RESET} {entry}{pad} {style}{Colors.BOLD}│{Colors.RESET}")
-    lines.append(f"  {frame_bottom(style)}")
+        lines.append(f"{indent}{style}{Colors.BOLD}│{Colors.RESET} {entry}{pad} {style}{Colors.BOLD}│{Colors.RESET}")
+    lines.append(f"{indent}{frame_bottom(style)}")
+    hint_base = f"{Colors.DIM}{Colors.GRAY}↑↓ move · ⏎ select · 0/Esc cancel{Colors.RESET}"
     if limit and len(options) > limit:
-        lines.append(f"  {Colors.GRAY}↑/↓ move · Enter select · 0/Esc cancel · {offset + 1}-{offset + len(visible)} of {len(options)}{Colors.RESET}")
+        lines.append(f"{indent}{hint_base}  {Colors.DIM}{Colors.GRAY}· {offset + 1}-{offset + len(visible)}/{len(options)}{Colors.RESET}")
     else:
-        lines.append(f"  {Colors.GRAY}↑/↓ move · Enter select · 0/Esc cancel{Colors.RESET}")
+        lines.append(f"{indent}{hint_base}")
     return lines
 
 def interactive_menu(title, options, style=Colors.VIOLET):
@@ -402,20 +458,66 @@ def render_text(text):
     return text
 
 def fake_loading(msg, duration=0.6):
-    frames = ["◜", "◠", "◝", "◞", "◡", "◟"]
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     end_time = time.time() + duration
     i = 0
+    indent = left_indent()
     while time.time() < end_time:
-        print(f"  {Colors.TEAL}{frames[i % len(frames)]}{Colors.RESET} {Colors.GRAY}{msg}{Colors.RESET}", end="\r")
+        print(f"{indent}{ACCENT}{frames[i % len(frames)]}{Colors.RESET} {Colors.DIM}{Colors.GRAY}{msg}{Colors.RESET}", end="\r")
         time.sleep(0.06)
         i += 1
-    print(f"  {Colors.GREEN}{Colors.BOLD}✓{Colors.RESET} {Colors.GRAY}{msg}{Colors.RESET}")
+    print(f"{indent}{ACCENT}{Colors.BOLD}✓{Colors.RESET} {Colors.DIM}{Colors.GRAY}{msg}{Colors.RESET}\033[K")
 
 def log_tool(msg):
     fake_loading(msg)
 
 def log_info(msg):
-    print(f"  {status_label('INFO', Colors.ORANGE)} {msg}{Colors.RESET}")
+    print(f"{left_indent()}{ACCENT}{Colors.BOLD}·{Colors.RESET} {Colors.DIM}{Colors.GRAY}info{Colors.RESET}  {msg}{Colors.RESET}")
+
+def log_ok(msg):
+    print(f"{left_indent()}{ACCENT}{Colors.BOLD}✓{Colors.RESET} {Colors.DIM}{Colors.GRAY}done{Colors.RESET}  {msg}{Colors.RESET}")
+
+def log_warn(msg):
+    print(f"{left_indent()}{Colors.YELLOW}{Colors.BOLD}!{Colors.RESET} {Colors.DIM}{Colors.GRAY}warn{Colors.RESET}  {msg}{Colors.RESET}")
+
+def summarize_tool_args(args):
+    if not isinstance(args, dict) or not args:
+        return ""
+    preview_keys = ["command", "path", "query", "pattern", "url", "repo_id", "text", "index", "status"]
+    parts = []
+    for key in preview_keys:
+        if key in args and args[key] not in (None, ""):
+            value = str(args[key]).replace("\n", " ")
+            if len(value) > 60:
+                value = value[:57] + "…"
+            parts.append(f"{Colors.DIM}{Colors.GRAY}{key}={Colors.RESET}{Colors.WHITE}{value}{Colors.RESET}")
+    leftover = [k for k in args if k not in preview_keys and args[k] not in (None, "")]
+    if leftover:
+        parts.append(f"{Colors.DIM}{Colors.GRAY}+{len(leftover)} more{Colors.RESET}")
+    return "  ".join(parts)
+
+def print_tool_call(name, args):
+    detail = summarize_tool_args(args)
+    line = f"{left_indent()}{ACCENT}{Colors.BOLD}⚙ {name}{Colors.RESET}"
+    if detail:
+        line += f"  {detail}"
+    print(line)
+
+TOOL_MARKUP_RE = re.compile(
+    r'<tool_call>.*?</tool_call>'
+    r'|<function\s*=.*?</function>'
+    r'|<tools>.*?</tools>'
+    r'|<tool_call>.*$'
+    r'|<function\s*=.*$',
+    re.DOTALL,
+)
+
+def strip_tool_markup(text):
+    if not text:
+        return text
+    cleaned = TOOL_MARKUP_RE.sub('', text)
+    cleaned = re.sub(r'```json\s*\{.*?\}\s*```', '', cleaned, flags=re.DOTALL)
+    return cleaned.strip()
 
 class Spinner:
     def __init__(self, msg="AI is thinking"):
@@ -452,8 +554,12 @@ class Spinner:
                 choices = [pulse for pulse in self.pulses if pulse != self.current_pulse] or self.pulses
                 self.current_pulse = random.choice(choices)
             pulse = self.current_pulse
-            color = [Colors.TEAL, Colors.VIOLET, Colors.PINK, Colors.LIME][i % 4]
-            line = f"  {color}{Colors.BOLD}{frame}{Colors.RESET} {color}{bar}{Colors.RESET} {Colors.WHITE}{self.msg}{Colors.RESET} {Colors.GRAY}{pulse} · {elapsed:04.1f}s{Colors.RESET}"
+            line = (
+                f"{left_indent()}{ACCENT}{Colors.BOLD}{frame}{Colors.RESET} "
+                f"{ACCENT}{bar}{Colors.RESET}  "
+                f"{Colors.WHITE}{self.msg}{Colors.RESET}  "
+                f"{Colors.DIM}{Colors.GRAY}{pulse} · {elapsed:04.1f}s{Colors.RESET}"
+            )
             pad = " " * max(0, self.last_len - clean_len(line))
             print(line + pad, end="\r")
             self.last_len = clean_len(line)
@@ -509,36 +615,54 @@ interrupter = InterruptionManager()
 
 def print_diff(diff_lines):
     if not diff_lines: return
-    print(f"\n  {frame_title('DIFF REPORT', Colors.MAGENTA)}")
+    indent = left_indent()
+    added = sum(1 for line in diff_lines if line.startswith('+') and not line.startswith('+++'))
+    removed = sum(1 for line in diff_lines if line.startswith('-') and not line.startswith('---'))
+    header_file = ""
     for line in diff_lines:
-        if line.startswith('+') and not line.startswith('+++'): print(f"    {Colors.GREEN}{Colors.BOLD}{line.rstrip()}{Colors.RESET}")
-        elif line.startswith('-') and not line.startswith('---'): print(f"    {Colors.RED}{line.rstrip()}{Colors.RESET}")
-        elif line.startswith('@@'): print(f"    {Colors.TEAL}{Colors.BOLD}{line.rstrip()}{Colors.RESET}")
-        else: print(f"    {Colors.GRAY}{line.rstrip()}{Colors.RESET}")
-    print(f"  {frame_bottom(Colors.MAGENTA)}\n")
+        if line.startswith('+++ '):
+            header_file = line[6:].strip() if line.startswith('+++ b/') else line[4:].strip()
+            break
+    subtitle = f"+{added} -{removed}" + (f" · {header_file}" if header_file else "")
+    print(f"\n{indent}{frame_title('DIFF', Colors.MAGENTA, subtitle=subtitle)}")
+    for line in diff_lines:
+        stripped = line.rstrip()
+        if line.startswith('+++') or line.startswith('---'):
+            print(f"{indent}  {Colors.DIM}{Colors.GRAY}{stripped}{Colors.RESET}")
+        elif line.startswith('+'):
+            print(f"{indent}  {Colors.GREEN}{Colors.BOLD}{stripped}{Colors.RESET}")
+        elif line.startswith('-'):
+            print(f"{indent}  {Colors.RED}{stripped}{Colors.RESET}")
+        elif line.startswith('@@'):
+            print(f"{indent}  {Colors.TEAL}{Colors.BOLD}{stripped}{Colors.RESET}")
+        else:
+            print(f"{indent}  {Colors.GRAY}{stripped}{Colors.RESET}")
+    print(f"{indent}{frame_bottom(Colors.MAGENTA)}\n")
 
 def print_logo():
-    logo = rf"""{Colors.TEAL}{Colors.BOLD}
-╭────────────────────────────────────────────────────────────────────────────╮
-│   *        .          *            .        *              *        .      │
-│       .        *             .         *              .        *           │
-│          *             .          *          .            *                │
-│   ██████╗  █████╗ ██╗     ██╗     ██╗██╗   ██╗██╗██╗   ██╗███╗   ███╗      │
-│  ██╔════╝ ██╔══██╗██║     ██║     ██║██║   ██║██║██║   ██║████╗ ████║      │
-│  ██║  ███╗███████║██║     ██║     ██║██║   ██║██║██║   ██║██╔████╔██║      │
-│  ██║   ██║██╔══██║██║     ██║     ██║╚██╗ ██╔╝██║██║   ██║██║╚██╔╝██║      │
-│  ╚██████╔╝██║  ██║███████╗███████╗██║ ╚████╔╝ ██║╚██████╔╝██║ ╚═╝ ██║      │
-│   ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═══╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝      │
-│       .         *              .           *        .              *       │
-│   *        .          *            .        *              *        .      │
-│          .       *          .             *         .        *             │
-╰────────────────────────────────────────────────────────────────────────────╯
-{Colors.RESET}{Colors.PINK}{Colors.BOLD}        local models  ✦  shell tools  ✦  files  ✦  web  ✦  autonomous coding{Colors.RESET}
-{Colors.GRAY}        Gallivium AI coding assistant for the terminal{Colors.RESET}
-"""
-    print(logo)
+    art_lines = [
+        " ██████╗  █████╗ ██╗     ██╗     ██╗██╗   ██╗██╗██╗   ██╗███╗   ███╗",
+        "██╔════╝ ██╔══██╗██║     ██║     ██║██║   ██║██║██║   ██║████╗ ████║",
+        "██║  ███╗███████║██║     ██║     ██║██║   ██║██║██║   ██║██╔████╔██║",
+        "██║   ██║██╔══██║██║     ██║     ██║╚██╗ ██╔╝██║██║   ██║██║╚██╔╝██║",
+        "╚██████╔╝██║  ██║███████╗███████╗██║ ╚████╔╝ ██║╚██████╔╝██║ ╚═╝ ██║",
+        " ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═══╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝",
+    ]
+    cols = term_cols()
+    art_width = max(len(line) for line in art_lines)
+    art_pad = " " * max(0, (cols - art_width) // 2)
+    tagline = "Gallivium · AI coding assistant for the terminal"
+    sub = "local models  ·  shell  ·  files  ·  web  ·  autonomous coding"
+    print()
+    for line in art_lines:
+        print(f"{art_pad}{Colors.WHITE}{Colors.BOLD}{line}{Colors.RESET}")
+    print()
+    print(f"{' ' * max(0, (cols - len(tagline)) // 2)}{Colors.DIM}{Colors.GRAY}{tagline}{Colors.RESET}")
+    print(f"{' ' * max(0, (cols - len(sub)) // 2)}{Colors.DIM}{Colors.GRAY}{sub}{Colors.RESET}")
+    print()
 
 MAX_OUTPUT_LENGTH = 10000
+MAX_URL_OUTPUT_LENGTH = 1500000
 HISTORY_THRESHOLD = 36
 COMPACT_RECENT_MESSAGES = 12
 COMPACT_MAX_MESSAGE_CHARS = 2200
@@ -803,8 +927,8 @@ def is_large_mlx_model(model):
     lowered = str(model).lower()
     return any(size in lowered for size in ["24b", "26b", "27b", "31b", "32b", "35b", "40b", "70b"])
 
-def truncate_output(output):
-    if len(str(output)) > MAX_OUTPUT_LENGTH: return str(output)[:MAX_OUTPUT_LENGTH] + f"\n\n[Output truncated due to size.]"
+def truncate_output(output, limit=MAX_OUTPUT_LENGTH):
+    if len(str(output)) > limit: return str(output)[:limit] + f"\n\n[Output truncated due to size.]"
     return str(output)
 
 
@@ -836,6 +960,43 @@ def extract_json_objects(text):
                     objects.append(text[start:i + 1])
                     start = None
     return objects
+
+NUMERIC_TOOL_ARGS = {"num_results", "index"}
+
+def _coerce_arg(key, value):
+    if key in NUMERIC_TOOL_ARGS:
+        try:
+            return int(str(value).strip())
+        except (ValueError, TypeError):
+            return value
+    return value
+
+def parse_xml_tool_calls(text):
+    """Parse Qwen/Hermes-style XML tool calls.
+
+    Handles blocks like:
+        <function=run_cmd>
+        <parameter=command>ls -la</parameter>
+        </function>
+    with or without an enclosing <tool_call>...</tool_call> wrapper.
+    """
+    calls = []
+    for fn_match in re.finditer(r'<function\s*=\s*([A-Za-z_][\w-]*)\s*>(.*?)</function>', text, re.DOTALL):
+        name = fn_match.group(1).strip()
+        body = fn_match.group(2)
+        args = {}
+        for param in re.finditer(r'<parameter\s*=\s*([A-Za-z_][\w-]*)\s*>(.*?)</parameter>', body, re.DOTALL):
+            key = param.group(1).strip()
+            value = param.group(2)
+            # trim a single leading/trailing newline that the format adds, keep inner content intact
+            if value.startswith("\n"):
+                value = value[1:]
+            if value.endswith("\n"):
+                value = value[:-1]
+            args[key] = _coerce_arg(key, value)
+        if name:
+            calls.append({'function': {'name': name, 'arguments': args}})
+    return calls
 
 def recover_tool_call_from_text(text):
     name_match = re.search(r'["\']?name["\']?\s*:\s*["\']?([A-Za-z_][\w-]*)["\']?', text)
@@ -910,6 +1071,37 @@ def direct_command_from_user(text):
     }
     return command if first in allowed else None
 
+def spawn_agents_tool_schema():
+    return {
+        'type': 'function',
+        'function': {
+            'name': 'spawn_agents',
+            'description': 'Spawn up to 4 independent autonomous OCLI worker agents in parallel. Each child gets its own tool loop and memory. Use read_only for investigation; use full only when agents have clear ownership and may run commands or edit files.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'agents': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'name': {'type': 'string'},
+                                'task': {'type': 'string'},
+                                'context': {'type': 'string'},
+                            },
+                            'required': ['task'],
+                        },
+                    },
+                    'shared_context': {'type': 'string', 'default': ''},
+                    'timeout_seconds': {'type': 'integer', 'default': 120},
+                    'max_steps': {'type': 'integer', 'default': 3},
+                    'tool_access': {'type': 'string', 'enum': ['read_only', 'full'], 'default': 'read_only'},
+                },
+                'required': ['agents'],
+            },
+        },
+    }
+
 class OCLI:
     def __init__(self, model_name, auto_mode=False, backend='ollama', url=None):
         self.model_name = model_name or BACKEND_DEFAULT_MODELS.get(backend, BACKEND_DEFAULT_MODELS["ollama"])
@@ -930,6 +1122,9 @@ class OCLI:
         self.tool_steps_this_turn = 0
         self.compaction_count = 0
         self.server_model = None
+        self.tool_access = "full"
+        self.allow_spawn_agents = True
+        self.non_interactive = False
         self.PLAN_PROMPT = "Planning is ENABLED. Before performing complex tasks, multiple file edits, or potentially destructive operations, you MUST create an implementation plan using the 'create_plan' tool. Break the plan down into discrete, numbered tasks that cover every explicit user requirement. As you work, use the 'update_task' tool to mark tasks as 'doing' and 'done'. After the plan is approved, continue by making real tool calls."
         cur_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.messages = [{
@@ -938,9 +1133,9 @@ class OCLI:
                 f"You are OCLI, an advanced AUTONOMOUS AI coding agent. Current date: {cur_date}. "
                 "CONVERSATION RULES: For greetings, questions, explanations, or any non-task message, respond in plain natural language. Do NOT call tools or output JSON for simple conversation. Only use tools when the user explicitly asks you to perform an action (run code, edit files, search, etc.). "
                 "Wrap internal reasoning in <thought> tags. "
-                "To call a tool, output exactly one tool call and nothing else: <tools>{{\"name\": \"tool_name\", \"arguments\": {{...}}}}</tools>. For shell commands, use <tools>{{\"name\":\"run_cmd\",\"arguments\":{{\"command\":\"pwd\"}}}}</tools> with the requested command. Available tools include run_cmd, read_file, write_file, test_cmd, list_files, search_files, grep, web_search, read_url, git_status, and git_diff. For coding tasks, write the complete requested implementation first, then write tests, then run pytest, then fix failures, then summarize final files. "
+                "To call a tool, emit a single tool call. Preferred format: <tools>{{\"name\": \"tool_name\", \"arguments\": {{...}}}}</tools>. For shell commands, use <tools>{{\"name\":\"run_cmd\",\"arguments\":{{\"command\":\"pwd\"}}}}</tools>. The native function-call format (<tool_call><function=run_cmd><parameter=command>pwd</parameter></function></tool_call>) is also accepted. Use exactly one format per call and provide every required argument. Available tools include run_cmd, read_file, write_file, test_cmd, list_files, search_files, find_files, grep, web_search, read_url, git_status, git_diff, and spawn_agents. For coding tasks, write the complete requested implementation first, then write tests, then run pytest, then fix failures, then summarize final files. "
                 "Do not write markdown code blocks when creating or editing files; use the write_file tool. Do not describe running commands; use run_cmd or test_cmd. Do not fabricate tool results, diffs, test output, file contents, or <tool_response> blocks. If a user asks you to create code, modify code, inspect files, run tests, install packages, or execute a program, you MUST call a real tool. "
-                "For multi-step tasks, after each successful real tool call, immediately make the next required real tool call only if it advances the original user request; do not output bare CONTINUE as a standalone response, and do not repeatedly run the same command or read/write the same file without changing strategy. If a test fails twice with the same error, inspect the file tree and relevant files before editing again. "
+                "For multi-step tasks, after each successful real tool call, immediately make the next required real tool call only if it advances the original user request; do not output bare CONTINUE as a standalone response, and do not repeatedly run the same command or read/write the same file without changing strategy. If list_files has already shown the tree, do not call it again; use search_files/find_files, grep, read_file, git_diff, or provide the final answer. If a test fails twice with the same error, inspect the file tree and relevant files before editing again. "
                 "CRITICAL: Use the 'test_cmd' tool for ANY command that might be interactive (games, prompts, servers). DO NOT use 'run_cmd' for these. MANDATORY: Always use 'write_file' for all code modifications to ensure the user sees a diff report. When the user asks for multiple searches, perform at least 3-5 searches. "
                 "IMPORTANT: You are an autonomous agent. NEVER ask the user to run a command. RUN IT YOURSELF. NEVER simulate tool results. ONLY use 'CONTINUE' if you have just called a tool and need to perform another step. ALWAYS prioritize answering the user's primary question directly after gathering data. If searching for software features, prioritize finding 'Release Notes' or 'What's New' pages. Planning is DISABLED. Do not use create_plan tool unless planning is explicitly enabled."
             )
@@ -1238,6 +1433,8 @@ class OCLI:
             if not self.auto_mode or is_dangerous:
                 reason = "Dangerous Pattern" if is_dangerous else "Manual Confirmation"
                 print(f"\n  {status_label('WARN', Colors.ORANGE)} {reason} {Colors.GRAY}│{Colors.RESET} {Colors.TEAL}{command}{Colors.RESET}")
+                if self.non_interactive:
+                    return f"Command blocked: non-interactive agent cannot confirm {reason.lower()} for `{command}`."
                 confirm = styled_input(f"  {Colors.BOLD}Confirm execution? (y/n):{Colors.RESET} ").strip().lower()
                 if confirm not in ['y', 'yes']: return "Command Aborted."
             else:
@@ -1246,6 +1443,8 @@ class OCLI:
                 audit_result = check_resp['message']['content'].strip().upper()
                 if "SAFE" not in audit_result or "UNSAFE" in audit_result:
                     print(f"\n  {status_label('WARN', Colors.ORANGE)} AI Audit UNSAFE {Colors.GRAY}│{Colors.RESET} {Colors.TEAL}{command}{Colors.RESET}")
+                    if self.non_interactive:
+                        return f"Command blocked: non-interactive agent cannot confirm unsafe command `{command}`."
                     confirm = styled_input(f"  {Colors.BOLD}Confirm execution? (y/n):{Colors.RESET} ").strip().lower()
                     if confirm not in ['y', 'yes']: return "Command Aborted."
                 else: print(f"\n  {status_label('AUTO SAFE', Colors.GREEN)} AI Audit Passed {Colors.GRAY}│{Colors.RESET} {Colors.TEAL}{command}{Colors.RESET}")
@@ -1385,6 +1584,8 @@ class OCLI:
         try:
             log_tool(f"Listing Files: {path}")
             res = []
+            max_entries = 350
+            truncated = False
             for root, dirs, files in os.walk(path):
                 dirs[:] = [d for d in dirs if d not in ['.git', '__pycache__', 'node_modules', '.venv', 'venv']]
                 level = root.replace(path, '').count(os.sep)
@@ -1393,6 +1594,12 @@ class OCLI:
                 res.append(f"{indent}{os.path.basename(root)}/")
                 sub_indent = '  ' * (level + 1)
                 for f in files: res.append(f"{sub_indent}{f}")
+                if len(res) >= max_entries:
+                    truncated = True
+                    break
+            if truncated:
+                res = res[:max_entries]
+                res.append("[truncated: use search_files/find_files, grep, or read_file for a narrower view]")
             result = "\n".join(res)
             print(f"\n  {frame_title('FILE TREE', Colors.MAGENTA)}\n{result}\n  {frame_bottom(Colors.MAGENTA)}\n")
             return result
@@ -1476,8 +1683,8 @@ class OCLI:
             text = re.sub(r'<style.*?>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
             text = re.sub(r'<[^>]+>', ' ', text)
             text = re.sub(r'\s+', ' ', text).strip()
-            print(f"\n  {frame_title('URL CONTENT', Colors.MAGENTA)}\n  {Colors.GRAY}{url}{Colors.RESET}\n\n{render_text(truncate_output(text))}\n  {frame_bottom(Colors.MAGENTA)}\n")
-            return truncate_output(text)
+            print(f"\n  {frame_title('URL CONTENT', Colors.MAGENTA)}\n  {Colors.GRAY}{url}{Colors.RESET}\n\n{render_text(truncate_output(text, MAX_URL_OUTPUT_LENGTH))}\n  {frame_bottom(Colors.MAGENTA)}\n")
+            return truncate_output(text, MAX_URL_OUTPUT_LENGTH)
         except Exception as e: return f"Error fetching URL: {str(e)}"
 
     def read_file(self, path):
@@ -1494,15 +1701,30 @@ class OCLI:
         try:
             log_tool(f"Writing: {path}")
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            existed = os.path.exists(path)
             old_content = ""
-            if os.path.exists(path):
+            if existed:
                 with open(path, 'r') as f: old_content = f.read()
             with open(path, 'w') as f: f.write(content)
-            if old_content:
-                diff = list(difflib.unified_diff(old_content.splitlines(keepends=True), content.splitlines(keepends=True), fromfile=f"a/{path}", tofile=f"b/{path}"))
-                if diff: print_diff(diff)
-                return f"File updated. Diff shown."
-            return f"File created."
+            from_label = f"a/{path}" if existed else "/dev/null"
+            to_label = f"b/{path}"
+            diff = list(difflib.unified_diff(
+                old_content.splitlines(keepends=True),
+                content.splitlines(keepends=True),
+                fromfile=from_label,
+                tofile=to_label,
+            ))
+            if diff:
+                print_diff(diff)
+            else:
+                print(f"\n{left_indent()}{frame_title('DIFF REPORT', Colors.MAGENTA, subtitle=path)}")
+                print(f"{left_indent()}  {Colors.DIM}{Colors.GRAY}(no changes — content identical){Colors.RESET}")
+                print(f"{left_indent()}{frame_bottom(Colors.MAGENTA)}\n")
+            added = sum(1 for line in diff if line.startswith('+') and not line.startswith('+++'))
+            removed = sum(1 for line in diff if line.startswith('-') and not line.startswith('---'))
+            if existed:
+                return f"File updated. Diff shown (+{added}/-{removed})."
+            return f"File created. Diff shown (+{added} lines)."
         except Exception as e: return f"Error: {str(e)}"
 
     def print_tasks(self):
@@ -1544,6 +1766,109 @@ class OCLI:
                 return f"Task {index} updated to {status}."
             return f"Invalid task index: {index}"
         except Exception as e: return f"Error: {str(e)}"
+
+    def _spawn_agent_chat(self, agent, shared_context="", timeout_seconds=120, max_steps=3, tool_access="read_only"):
+        name = str(agent.get("name") or "agent").strip()[:80] or "agent"
+        task = str(agent.get("task") or agent.get("prompt") or "").strip()
+        agent_context = str(agent.get("context") or "").strip()
+        if not task:
+            return {"name": name, "status": "error", "response": "Missing agent task."}
+        payload = {
+            "name": name,
+            "task": task,
+            "context": agent_context,
+            "shared_context": shared_context,
+            "model_name": self.model_name,
+            "backend": self.backend,
+            "url": self.url,
+            "tool_access": tool_access,
+            "max_steps": max_steps,
+        }
+        cmd = [sys.executable, os.path.abspath(__file__), "--spawn-agent-worker", "--skip-install"]
+        try:
+            completed = subprocess.run(cmd, input=json.dumps(payload), capture_output=True, text=True, timeout=timeout_seconds + 30)
+            try:
+                data = json.loads(completed.stdout)
+                data["name"] = name
+                return data
+            except json.JSONDecodeError:
+                pass
+            if completed.returncode != 0:
+                return {
+                    "name": name,
+                    "status": "error",
+                    "response": truncate_output(completed.stderr or completed.stdout or f"Worker exited with code {completed.returncode}", 4000),
+                }
+            return {"name": name, "status": "error", "response": "Worker completed without JSON output."}
+        except subprocess.TimeoutExpired:
+            return {"name": name, "status": "timeout", "response": f"Timed out after {timeout_seconds}s."}
+        except json.JSONDecodeError as e:
+            return {"name": name, "status": "error", "response": f"Worker returned invalid JSON: {e}"}
+        except Exception as e:
+            return {"name": name, "status": "error", "response": str(e)}
+
+    def spawn_agents(self, agents, shared_context="", timeout_seconds=120, max_steps=3, tool_access="read_only"):
+        try:
+            if isinstance(agents, str):
+                agents = [{"name": "agent_1", "task": agents}]
+            elif isinstance(agents, dict):
+                agents = agents.get("agents", [agents])
+            if not isinstance(agents, list) or not agents:
+                return "Error: agents must be a non-empty list of task objects."
+
+            normalized = []
+            for index, agent in enumerate(agents[:4], 1):
+                if isinstance(agent, str):
+                    normalized.append({"name": f"agent_{index}", "task": agent})
+                elif isinstance(agent, dict):
+                    normalized.append({
+                        "name": str(agent.get("name") or f"agent_{index}"),
+                        "task": str(agent.get("task") or agent.get("prompt") or ""),
+                        "context": str(agent.get("context") or ""),
+                    })
+            if not normalized:
+                return "Error: no valid agent tasks were provided."
+
+            timeout_seconds = max(10, min(int(timeout_seconds or 120), 600))
+            max_steps = max(1, min(int(max_steps or 3), 8))
+            tool_access = tool_access if tool_access in ["read_only", "full"] else "read_only"
+            if self.backend == "mlx":
+                self.ensure_mlx_server()
+            log_tool(f"SPAWN_AGENTS: {len(normalized)} agents · {tool_access}")
+
+            results = [None] * len(normalized)
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(normalized))
+            futures = {
+                executor.submit(self._spawn_agent_chat, agent, shared_context, timeout_seconds, max_steps, tool_access): index
+                for index, agent in enumerate(normalized)
+            }
+            try:
+                for future in concurrent.futures.as_completed(futures, timeout=timeout_seconds + 5):
+                    index = futures[future]
+                    try:
+                        results[index] = future.result()
+                    except Exception as e:
+                        results[index] = {"name": normalized[index]["name"], "status": "error", "response": str(e)}
+            except concurrent.futures.TimeoutError:
+                pass
+            finally:
+                for future, index in futures.items():
+                    if results[index] is None:
+                        future.cancel()
+                        results[index] = {"name": normalized[index]["name"], "status": "timeout", "response": f"Timed out after {timeout_seconds}s."}
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    executor.shutdown(wait=False)
+
+            summary_lines = [
+                f"{Colors.CYAN}{result['name']}{Colors.RESET} {Colors.GRAY}({result['status']}){Colors.RESET}: {truncate_output(result['response'], 500)}"
+                for result in results
+            ]
+            print_panel("SPAWNED AGENTS", summary_lines, Colors.CYAN)
+            return "Spawned agent results:\n" + json.dumps(results, indent=2)
+        except Exception as e:
+            return f"Error: {str(e)}"
 
     def setup_llama_cpp(self):
         log_info("Starting llama.cpp Automation Setup for macOS...")
@@ -1760,16 +2085,34 @@ class OCLI:
 
     def run(self):
         print_logo()
-        print_panel("SESSION", [
-            f"{Colors.TEAL}Model{Colors.RESET}      {self.model_name}",
-            f"{Colors.TEAL}Backend{Colors.RESET}    {self.backend}",
-            f"{Colors.TEAL}Auto Mode{Colors.RESET}  {mode_value(self.auto_mode)}",
-            f"{Colors.GRAY}Type {Colors.WHITE}exit{Colors.GRAY} to quit or {Colors.WHITE}/help{Colors.GRAY} for commands.{Colors.RESET}"
-        ], Colors.TEAL)
+        print_panel("session", [
+            kv_row("model",   f"{Colors.WHITE}{self.model_name}{Colors.RESET}"),
+            kv_row("backend", f"{Colors.WHITE}{self.backend}{Colors.RESET}"),
+            kv_row("auto",    mode_value(self.auto_mode)),
+            "",
+            f"{Colors.DIM}{Colors.GRAY}/help for commands · exit to quit{Colors.RESET}",
+        ], MUTED)
         while True:
             try:
-                print(soft_rule(Colors.VIOLET))
-                user_input = styled_input(f"\n  {Colors.VIOLET}{Colors.BOLD}╭─ OCLI{Colors.RESET} {Colors.GRAY}{self.backend}:{Colors.RESET}{Colors.TEAL}{self.model_name}{Colors.RESET}\n  {Colors.VIOLET}{Colors.BOLD}╰─>{Colors.RESET} ").strip()
+                width = term_width()
+                inner = width - 2
+                indent = left_indent()
+                meta_left = f" OCLI "
+                meta_right = f" {self.backend}:{self.model_name} · auto {'on' if self.auto_mode else 'off'} · plan {'on' if self.planning_enabled else 'off'} "
+                fill = max(2, inner - len(meta_left) - len(meta_right))
+                top = (
+                    f"{indent}{MUTED}╭─{Colors.RESET}"
+                    f"{ACCENT}{Colors.BOLD}{meta_left}{Colors.RESET}"
+                    f"{MUTED}{'─' * fill}{Colors.RESET}"
+                    f"{Colors.DIM}{Colors.GRAY}{meta_right}{Colors.RESET}"
+                    f"{MUTED}─╮{Colors.RESET}"
+                )
+                bottom = f"{indent}{MUTED}╰{'─' * (width - 2)}╯{Colors.RESET}"
+                print()
+                print(top)
+                prompt_inline = f"{indent}{MUTED}│{Colors.RESET} {ACCENT}{Colors.BOLD}❯{Colors.RESET} "
+                user_input = styled_input(prompt_inline).strip()
+                print(bottom)
                 print("")
                 print(soft_rule(Colors.VIOLET))
                 if not user_input: continue
@@ -1803,14 +2146,14 @@ class OCLI:
                         self.load_session(cmd_parts[1])
                         continue
                     elif cmd == '/status':
-                        print_panel("STATUS", [
-                            f"{Colors.TEAL}Model{Colors.RESET}      {self.model_name}",
-                            f"{Colors.TEAL}Backend{Colors.RESET}    {self.backend}",
-                            f"{Colors.TEAL}Auto Mode{Colors.RESET}  {mode_value(self.auto_mode)}",
-                            f"{Colors.TEAL}Planning{Colors.RESET}   {mode_value(self.planning_enabled, 'ENABLED', 'DISABLED')}",
-                            f"{Colors.TEAL}History{Colors.RESET}    {len(self.messages)} messages",
-                            f"{Colors.TEAL}Compacted{Colors.RESET}  {self.compaction_count} times"
-                        ], Colors.TEAL)
+                        print_panel("status", [
+                            kv_row("model",     f"{Colors.WHITE}{self.model_name}{Colors.RESET}"),
+                            kv_row("backend",   f"{Colors.WHITE}{self.backend}{Colors.RESET}"),
+                            kv_row("auto",      mode_value(self.auto_mode)),
+                            kv_row("planning",  mode_value(self.planning_enabled)),
+                            kv_row("history",   f"{Colors.WHITE}{len(self.messages)}{Colors.RESET} {Colors.DIM}{Colors.GRAY}messages{Colors.RESET}"),
+                            kv_row("compacted", f"{Colors.WHITE}{self.compaction_count}{Colors.RESET} {Colors.DIM}{Colors.GRAY}times{Colors.RESET}"),
+                        ], MUTED)
                         continue
                     elif cmd == '/backend':
                         if len(cmd_parts) > 1 and cmd_parts[1] in BACKEND_DEFAULT_URLS:
@@ -1838,23 +2181,31 @@ class OCLI:
                         self.print_tasks()
                         continue
                     elif cmd == '/help':
-                        print_panel("COMMANDS", [
-                            f"{Colors.CYAN}/status{Colors.RESET}       {Colors.GRAY}Show model and backend status{Colors.RESET}",
-                            f"{Colors.CYAN}/help{Colors.RESET}         {Colors.GRAY}Show this command deck{Colors.RESET}",
-                            f"{Colors.CYAN}/backend{Colors.RESET}      {Colors.GRAY}Open the backend switcher{Colors.RESET}",
-                            f"{Colors.CYAN}/model{Colors.RESET}        {Colors.GRAY}Open the model switcher{Colors.RESET}",
-                            f"{Colors.CYAN}/download_model [m] [--path dir]{Colors.RESET} {Colors.GRAY}Download a model for the active backend{Colors.RESET}",
-                            f"{Colors.CYAN}/auto{Colors.RESET}         {Colors.GRAY}Toggle auto-execution mode{Colors.RESET}",
-                            f"{Colors.CYAN}/plan{Colors.RESET}         {Colors.GRAY}Toggle autonomous planning mode{Colors.RESET}",
-                            f"{Colors.CYAN}/tasks{Colors.RESET}        {Colors.GRAY}Show progress checkpoints{Colors.RESET}",
-                            f"{Colors.CYAN}/save [file]{Colors.RESET}  {Colors.GRAY}Save current session to JSON{Colors.RESET}",
-                            f"{Colors.CYAN}/load <file>{Colors.RESET}  {Colors.GRAY}Load a session from JSON{Colors.RESET}",
-                            f"{Colors.CYAN}/setup_mlx{Colors.RESET}    {Colors.GRAY}Install and download MLX models{Colors.RESET}",
-                            f"{Colors.CYAN}/download <r> [--path dir]{Colors.RESET} {Colors.GRAY}Download an MLX model from Hugging Face{Colors.RESET}",
-                            f"{Colors.CYAN}/exit{Colors.RESET}         {Colors.GRAY}Quit OCLI{Colors.RESET}",
+                        def help_row(cmd_text, desc):
+                            pad = max(0, 34 - clean_len(cmd_text))
+                            return f"  {Colors.WHITE}{cmd_text}{Colors.RESET}{' ' * pad}{Colors.DIM}{Colors.GRAY}{desc}{Colors.RESET}"
+                        def help_header(text):
+                            return f"  {Colors.DIM}{Colors.GRAY}── {text} ──{Colors.RESET}"
+                        print_panel("commands", [
+                            help_header("session"),
+                            help_row("/status",                          "show model and backend status"),
+                            help_row("/tasks",                           "show progress checkpoints"),
+                            help_row("/save [file]",                     "save current session to JSON"),
+                            help_row("/load <file>",                     "load a session from JSON"),
+                            help_row("/exit",                            "quit OCLI"),
                             "",
-                            f"{Colors.GRAY}Tools like read_url and web_search are used automatically during exploration.{Colors.RESET}"
-                        ], Colors.VIOLET)
+                            help_header("models & backends"),
+                            help_row("/backend",                         "open the backend switcher"),
+                            help_row("/model",                           "open the model switcher"),
+                            help_row("/download_model [m] [--path dir]", "download a model for the active backend"),
+                            help_row("/download <repo> [--path dir]",    "download an MLX model from Hugging Face"),
+                            help_row("/setup_mlx",                       "install and download MLX models"),
+                            "",
+                            help_header("behavior"),
+                            help_row("/auto",                            "toggle auto-execution mode"),
+                            help_row("/plan",                            "toggle autonomous planning mode"),
+                            help_row("/help",                            "show this command list"),
+                        ], MUTED)
                         continue
                     elif cmd == '/setup':
                         self.setup_llama_cpp()
@@ -1902,7 +2253,7 @@ class OCLI:
                     )
                     if should_continue:
                         auto_count += 1
-                        print(f"\n  {status_label('AUTO', Colors.ORANGE)} Continuing step {auto_count}/10")
+                        print(f"\n{left_indent()}{ACCENT}↻{Colors.RESET} {Colors.DIM}{Colors.GRAY}auto{Colors.RESET}  continuing step {Colors.WHITE}{auto_count}{Colors.DIM}/10{Colors.RESET}")
                         self.messages.append({'role': 'user', 'content': f"Continue the original task and make concrete progress toward completion. Original request:\n{self.last_user_goal}\nDo not repeat the same command/read cycle. If implementation is incomplete, write the full files now. If files are written, run pytest. If tests pass, summarize final files and usage."})
                     else:
                         break
@@ -1910,7 +2261,12 @@ class OCLI:
 
     def process_chat(self):
         had_tool_calls = False
-        available_tools = {'run_cmd': self.run_cmd, 'read_file': self.read_file, 'write_file': self.write_file, 'web_search': self.web_search, 'create_plan': self.create_plan, 'update_task': self.update_task, 'test_cmd': self.test_cmd, 'send_input': self.send_input, 'read_url': self.read_url, 'download_mlx_model': self.download_mlx_model, 'list_files': self.list_files, 'search_files': self.search_files, 'grep': self.grep, 'git_status': self.git_status, 'git_diff': self.git_diff}
+        available_tools = {'run_cmd': self.run_cmd, 'read_file': self.read_file, 'write_file': self.write_file, 'web_search': self.web_search, 'create_plan': self.create_plan, 'update_task': self.update_task, 'test_cmd': self.test_cmd, 'send_input': self.send_input, 'read_url': self.read_url, 'download_mlx_model': self.download_mlx_model, 'list_files': self.list_files, 'search_files': self.search_files, 'find_files': self.search_files, 'grep': self.grep, 'git_status': self.git_status, 'git_diff': self.git_diff, 'spawn_agents': self.spawn_agents}
+        read_only_tool_names = {'read_file', 'web_search', 'read_url', 'list_files', 'search_files', 'find_files', 'grep', 'git_status', 'git_diff'}
+        if self.tool_access == "read_only":
+            available_tools = {name: tool for name, tool in available_tools.items() if name in read_only_tool_names}
+        if not self.allow_spawn_agents:
+            available_tools.pop('spawn_agents', None)
         tool_reprompt_count = 0
         invalid_tool_reprompt_count = 0
         while True:
@@ -1928,13 +2284,17 @@ class OCLI:
                     {'type': 'function', 'function': {'name': 'send_input', 'description': 'Send text input to the active test process.', 'parameters': {'type': 'object', 'properties': {'text': {'type': 'string'}}, 'required': ['text']}}},
                     {'type': 'function', 'function': {'name': 'list_files', 'description': 'List files and directories in a path (tree view, max depth 3).', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'default': '.'}}, 'required': []}}},
                     {'type': 'function', 'function': {'name': 'search_files', 'description': 'Find files by name pattern.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}, 'path': {'type': 'string', 'default': '.'}}, 'required': ['query']}}},
+                    {'type': 'function', 'function': {'name': 'find_files', 'description': 'Alias for search_files. Find files by name pattern.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}, 'path': {'type': 'string', 'default': '.'}}, 'required': ['query']}}},
                     {'type': 'function', 'function': {'name': 'grep', 'description': 'Search file contents for a pattern (like grep -rIn).', 'parameters': {'type': 'object', 'properties': {'pattern': {'type': 'string'}, 'path': {'type': 'string', 'default': '.'}}, 'required': ['pattern']}}},
                     {'type': 'function', 'function': {'name': 'git_status', 'description': 'Show git status of the current repo.', 'parameters': {'type': 'object', 'properties': {}, 'required': []}}},
                     {'type': 'function', 'function': {'name': 'git_diff', 'description': 'Show git diff of changes. Optionally for a specific file.', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string', 'default': ''}}, 'required': []}}},
+                    spawn_agents_tool_schema(),
                 ]
                 if self.planning_enabled:
                     tools.append({'type': 'function', 'function': {'name': 'create_plan', 'description': 'Create an implementation plan before performing complex tasks.', 'parameters': {'type': 'object', 'properties': {'plan': {'type': 'string'}}, 'required': ['plan']}}})
                     tools.append({'type': 'function', 'function': {'name': 'update_task', 'description': 'Update the status of a task in the current plan.', 'parameters': {'type': 'object', 'properties': {'index': {'type': 'string', 'description': 'The 1-based index of the task'}, 'status': {'type': 'string', 'enum': ['todo', 'doing', 'done']}}, 'required': ['index', 'status']}}})
+                if self.tool_access == "read_only" or not self.allow_spawn_agents:
+                    tools = [tool for tool in tools if tool.get('function', {}).get('name') in available_tools]
 
                 if self.backend == 'mlx':
                     self.ensure_mlx_server()
@@ -1945,16 +2305,22 @@ class OCLI:
                 content, tool_calls, response_metadata = "", [], {}
                 first_chunk = True
                 in_thought, in_tool, thought_labeled, line_buffer = False, False, False, ""
-                tags_to_hide = ["<thought>", "</thought>", "<tools>", "</tools>", "<tool_call>", "</tool_call>", "<response>", "</response>", "<result>", "</result>", "```json", "```", "Thought:", "THINKING:", "<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+                tags_to_hide = ["<thought>", "</thought>", "<tools>", "</tools>", "<tool_call>", "</tool_call>", "</function>", "</parameter>", "<response>", "</response>", "<result>", "</result>", "<tool_response>", "</tool_response>", "```json", "```", "Thought:", "THINKING:", "<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+                tool_start_re = re.compile(r'<(?:function|parameter)\s*=')
 
                 def process_token(token):
                     nonlocal first_chunk, in_thought, in_tool, thought_labeled, line_buffer, content
                     content += token
-                    
+
                     if first_chunk and token.strip():
                         spinner.stop()
-                        print(f"\n{Colors.TEAL}{Colors.BOLD}◆ OCLI{Colors.RESET} {Colors.GRAY}›{Colors.RESET} ", end="", flush=True)
+                        print(f"\n{left_indent()}{ACCENT}{Colors.BOLD}❯ OCLI{Colors.RESET} {Colors.DIM}{Colors.GRAY}·{Colors.RESET} ", end="", flush=True)
                         first_chunk = False
+
+                    # Qwen/Hermes XML tool calls use variable-length tags (<function=...>),
+                    # so detect them with a regex over the recently-added region.
+                    if not in_tool and tool_start_re.search(content[-(len(token) + 12):]):
+                        in_tool = True
 
                     for tag in tags_to_hide:
                         if tag in content and tag not in content[:-len(token)]:
@@ -1968,12 +2334,13 @@ class OCLI:
                                         print(f"{Colors.ORANGE}{Colors.BOLD}thinking{Colors.RESET}", end="", flush=True)
                                         thought_labeled = True
                                 else: in_tool = True
-                    
+
                     if not in_thought and not in_tool:
                         line_buffer += token
                         for tag in tags_to_hide: line_buffer = line_buffer.replace(tag, "")
-                        
+
                         is_potential_tag = any(line_buffer.endswith(tag[:i]) for tag in tags_to_hide for i in range(1, len(tag)))
+                        is_potential_tag = is_potential_tag or line_buffer.rstrip().endswith("<")
                         if not is_potential_tag and "\n" in line_buffer:
                             parts = line_buffer.split("\n")
                             for i in range(len(parts)-1): print(render_text(parts[i] + "\n"), end="", flush=True)
@@ -2086,6 +2453,13 @@ class OCLI:
                 print()
                 
                 if not tool_calls:
+                    # 1) Qwen/Hermes XML function-call format: <function=name><parameter=k>v</parameter></function>
+                    xml_calls = parse_xml_tool_calls(content)
+                    if xml_calls:
+                        tool_calls.extend(xml_calls)
+
+                if not tool_calls:
+                    # 2) JSON wrapped in <tools>/<tool_call>/<response>, fenced ```json, or bare objects
                     tool_matches = re.findall(r'<(?:tools|tool_call|response)>(.*?)(?:</(?:tools|tool_call|response)>|$)', content, re.DOTALL)
                     if not tool_matches:
                         tool_matches = re.findall(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
@@ -2094,8 +2468,11 @@ class OCLI:
                             if '"name"' in obj and '"arguments"' in obj:
                                 tool_matches.append(obj.replace("{{", "{").replace("}}", "}"))
                     for match in tool_matches:
+                        snippet = match.strip()
+                        if not snippet:
+                            continue
                         try:
-                            data = json.loads(match.strip())
+                            data = json.loads(snippet)
                             if isinstance(data, list):
                                 for item in data:
                                     if isinstance(item, dict) and item.get('name'):
@@ -2103,17 +2480,17 @@ class OCLI:
                             elif isinstance(data, dict) and data.get('name'):
                                 tool_calls.append({'function': {'name': data.get('name'), 'arguments': data.get('arguments', {})}})
                         except Exception as e:
-                            recovered = recover_tool_call_from_text(match.strip())
+                            recovered = parse_xml_tool_calls(snippet) or recover_tool_call_from_text(snippet)
                             if recovered:
-                                log_info("Recovered malformed tool JSON from model output")
-                                tool_calls.append(recovered)
+                                log_info("Recovered tool call from non-JSON model output")
+                                tool_calls.extend(recovered if isinstance(recovered, list) else [recovered])
                             else:
-                                log_info(f"Failed to parse tool JSON: {e}")
+                                log_info(f"Failed to parse tool call: {e}")
 
                     if not tool_calls:
                         recovered = recover_tool_call_from_text(content)
                         if recovered:
-                            log_info("Recovered malformed tool JSON from full model output")
+                            log_info("Recovered malformed tool call from full model output")
                             tool_calls.append(recovered)
 
                 lower_content = content.lower()
@@ -2173,7 +2550,7 @@ class OCLI:
                         if name:
                             formatted_calls.append({'id': tc.get('id', 'call_' + str(int(time.time()))), 'type': 'function', 'function': {'name': name, 'arguments': args}})
                     if formatted_calls:
-                        self.messages.append({'role': 'assistant', 'content': content or "", 'tool_calls': formatted_calls})
+                        self.messages.append({'role': 'assistant', 'content': strip_tool_markup(content), 'tool_calls': formatted_calls})
                     else:
                         self.messages.append({'role': 'assistant', 'content': content or ""})
                 else:
@@ -2237,15 +2614,23 @@ class OCLI:
 
                         if self.repeated_tool_count >= 2:
                             log_info(f"Blocking repeated tool call: {name}")
-                            self.messages.append({'role': 'tool', 'content': "Repeated tool call blocked. Change strategy now: inspect the project tree with `find . -maxdepth 3 -type f`, read the relevant files, then fix the actual root cause. Do not repeat the same write/test cycle.", 'tool_call_id': call_id, 'name': name})
+                            repeated_hint = (
+                                f"Repeated `{name}` call skipped. You already have that tool output in the conversation. "
+                                "Do not call the same tool with the same arguments again. Use search_files/find_files, grep, read_file, git_diff, or provide the final answer now."
+                            )
+                            self.messages.append({'role': 'tool', 'content': repeated_hint, 'tool_call_id': call_id, 'name': name})
+                            valid_tool_calls += 1
+                            had_tool_calls = True
                             continue
 
                         if self.tool_steps_this_turn >= 50:
-                            log_info("Stopping tool loop after 12 tool steps in one user turn")
+                            log_info("Stopping tool loop after 50 tool steps in one user turn")
                             self.messages.append({'role': 'tool', 'content': "Tool step limit reached for this turn. Stop looping and give the user a concise status report with the exact remaining failure and next manual fix.", 'tool_call_id': call_id, 'name': name})
                             break
 
-                        result = truncate_output(available_tools[name](**args))
+                        print_tool_call(name, args)
+                        tool_limit = MAX_URL_OUTPUT_LENGTH if name == 'read_url' else MAX_OUTPUT_LENGTH
+                        result = truncate_output(available_tools[name](**args), tool_limit)
                         self.tool_steps_this_turn += 1
 
                         if name in ['test_cmd', 'run_cmd']:
@@ -2312,6 +2697,84 @@ class OCLI:
                 print(f"{Colors.RED}Error: {e}{Colors.RESET}")
                 return False
 
+def run_spawn_agent_worker():
+    try:
+        request = json.load(sys.stdin)
+    except Exception as e:
+        print(json.dumps({"status": "error", "response": f"Invalid worker payload: {e}", "log": ""}))
+        return 1
+
+    name = str(request.get("name") or "agent").strip()[:80] or "agent"
+    task = str(request.get("task") or "").strip()
+    context = str(request.get("context") or "").strip()
+    shared_context = str(request.get("shared_context") or "").strip()
+    backend = request.get("backend") or "ollama"
+    model_name = request.get("model_name") or BACKEND_DEFAULT_MODELS.get(backend, BACKEND_DEFAULT_MODELS["ollama"])
+    url = request.get("url")
+    tool_access = request.get("tool_access") if request.get("tool_access") in ["read_only", "full"] else "read_only"
+    try:
+        max_steps = max(1, min(int(request.get("max_steps") or 3), 8))
+    except Exception:
+        max_steps = 3
+
+    log_buffer = io.StringIO()
+    status = "ok"
+    response_text = ""
+    try:
+        with contextlib.redirect_stdout(log_buffer):
+            agent = OCLI(model_name=model_name, auto_mode=True, backend=backend, url=url)
+            agent.tool_access = tool_access
+            agent.allow_spawn_agents = False
+            agent.non_interactive = True
+            agent.messages[0]["content"] += (
+                f" You are spawned worker agent `{name}`. You have your own tool loop and memory. "
+                "You are not alone in the workspace; avoid broad edits and do not overwrite unrelated changes. "
+                "If tool_access is read_only, inspect and report only. If tool_access is full, edit or run commands only when the task clearly requires it. "
+                "Before making claims about the current workspace, inspect it with an available tool. "
+                "Do not spawn more agents. Finish with concise findings, exact files touched if any, and remaining risks."
+            )
+            user_parts = []
+            if shared_context:
+                user_parts.append(f"Shared context:\n{shared_context}")
+            if context:
+                user_parts.append(f"Agent-specific context:\n{context}")
+            user_parts.append(f"Task:\n{task}")
+            user_parts.append(f"Tool access: {tool_access}")
+            agent.last_user_goal = task
+            agent.messages.append({"role": "user", "content": "\n\n".join(user_parts)})
+            for step in range(max_steps):
+                agent.compact_history()
+                agent.process_chat()
+                last_content = next((m.get("content", "") for m in reversed(agent.messages) if m.get("role") == "assistant" and m.get("content")), "")
+                if "CONTINUE" not in str(last_content).upper() or step == max_steps - 1:
+                    break
+                agent.messages.append({"role": "user", "content": "Continue the assigned worker task. Use tools only if they materially advance the task; otherwise provide the final worker summary."})
+            agent.cleanup()
+
+        response_text = next(
+            (
+                str(m.get("content", "")).strip()
+                for m in reversed(agent.messages)
+                if m.get("role") == "assistant" and str(m.get("content", "")).strip() and not m.get("tool_calls")
+            ),
+            "",
+        )
+        if not response_text:
+            status = "no_final"
+            response_text = "Worker completed without a final assistant summary."
+    except Exception as e:
+        status = "error"
+        response_text = str(e)
+
+    print(json.dumps({
+        "name": name,
+        "status": status,
+        "tool_access": tool_access,
+        "response": truncate_output(response_text, 5000),
+        "log": truncate_output(clean_ansi(log_buffer.getvalue()), 5000),
+    }))
+    return 0 if status != "error" else 1
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str)
@@ -2319,9 +2782,12 @@ if __name__ == "__main__":
     parser.add_argument("--backend", type=str, choices=['ollama', 'llama-cpp', 'mlx', 'airllm'], default="ollama")
     parser.add_argument("--url", type=str, help="Server URL (e.g. http://localhost:8080)")
     parser.add_argument("--skip-install", action="store_true", help="Skip automatic OCLI launcher installation")
+    parser.add_argument("--spawn-agent-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.skip_install:
         os.environ["OCLI_SKIP_INSTALL"] = "1"
+    if args.spawn_agent_worker:
+        sys.exit(run_spawn_agent_worker())
     install_cli_launcher()
     agent = OCLI(model_name=args.model or BACKEND_DEFAULT_MODELS[args.backend], auto_mode=args.auto, backend=args.backend, url=args.url)
     agent.run()
