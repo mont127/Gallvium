@@ -1,5 +1,6 @@
 # OLCode
-<img width="1123" height="492" alt="Screenshot 2026-05-10 at 13 55 47" src="https://github.com/user-attachments/assets/68a58cdf-07f2-475e-86a3-158d57451f03" />
+<img width="1469" height="296" alt="Screenshot 2026-05-28 at 18 08 02" src="https://github.com/user-attachments/assets/6f503eed-bec5-4910-b0c9-8d580a1efc75" />
+
 
 An advanced agentic AI coding assistant designed for autonomous system-level operations.
 
