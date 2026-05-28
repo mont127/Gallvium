@@ -85,6 +85,15 @@ def term_cols(default=100):
         return default
 
 LEFT_MARGIN = 2
+RESIZE_FLAG = [False]
+
+def _on_resize(signum, frame):
+    RESIZE_FLAG[0] = True
+
+try:
+    signal.signal(signal.SIGWINCH, _on_resize)
+except (AttributeError, ValueError):
+    pass
 
 def term_width(default=92):
     cols = term_cols(default + LEFT_MARGIN * 2)
@@ -137,17 +146,22 @@ def kv_row(label, value, label_width=11):
     pad = max(0, label_width - clean_len(label))
     return f"{Colors.DIM}{Colors.GRAY}{label}{Colors.RESET}{' ' * pad}  {value}"
 
-def print_panel(title, lines, style=Colors.CYAN):
+def panel_lines(title, lines, style=Colors.CYAN):
     width = term_width()
     inner_width = width - 4
     indent = left_indent()
-    print(f"{indent}{frame_title(title, style)}")
+    out = [f"{indent}{frame_title(title, style)}"]
     for line in lines:
         chunks = str(line).splitlines() or [""]
         for chunk in chunks:
             pad = " " * max(0, inner_width - clean_len(chunk))
-            print(f"{indent}{style}{Colors.BOLD}│{Colors.RESET} {chunk}{pad} {style}{Colors.BOLD}│{Colors.RESET}")
-    print(f"{indent}{frame_bottom(style)}")
+            out.append(f"{indent}{style}{Colors.BOLD}│{Colors.RESET} {chunk}{pad} {style}{Colors.BOLD}│{Colors.RESET}")
+    out.append(f"{indent}{frame_bottom(style)}")
+    return out
+
+def print_panel(title, lines, style=Colors.CYAN):
+    for line in panel_lines(title, lines, style):
+        print(line)
 
 def print_frame_line(text="", style=Colors.MAGENTA):
     inner_width = term_width() - 4
@@ -185,6 +199,21 @@ INPUT_PUSHBACK = bytearray()
 
 def input_ready(fd, timeout):
     return bool(INPUT_PUSHBACK) or bool(select.select([fd], [], [], timeout)[0])
+
+def wait_for_key_or_resize(fd, on_resize, debounce=0.12):
+    while True:
+        if RESIZE_FLAG[0]:
+            RESIZE_FLAG[0] = False
+            settled = 0.0
+            while settled < debounce:
+                time.sleep(0.04)
+                settled += 0.04
+                if RESIZE_FLAG[0]:
+                    RESIZE_FLAG[0] = False
+                    settled = 0.0
+            on_resize()
+        if input_ready(fd, 0.08):
+            return
 
 def read_input_byte(fd):
     if INPUT_PUSHBACK:
@@ -235,7 +264,7 @@ def read_bracketed_paste(fd):
             return bytes(data[:index]).decode(errors='ignore')
     return bytes(data).decode(errors='ignore')
 
-def styled_input(prompt, default=None):
+def styled_input(prompt, default=None, header_fn=None, prompt_fn=None):
     if not can_use_terminal_keys():
         return input(prompt)
     fd = sys.stdin.fileno()
@@ -243,6 +272,7 @@ def styled_input(prompt, default=None):
     units = [{"display": ch, "actual": ch} for ch in (default or "")]
     cursor = len(units)
     last_prompt = prompt.split("\n")[-1]
+    header_lines_vis = [clean_len(line) for line in header_fn().split("\n")] if header_fn is not None else []
 
     def display_text():
         return "".join(unit["display"] for unit in units)
@@ -253,9 +283,24 @@ def styled_input(prompt, default=None):
     def display_len(slice_units):
         return clean_len("".join(unit["display"] for unit in slice_units))
 
-    def redraw():
+    def header_rows(cols):
+        return sum(((vis - 1) // cols + 1) if vis > 0 else 1 for vis in header_lines_vis)
+
+    def redraw(repaint_header=False):
+        nonlocal last_prompt, header_lines_vis
+        if prompt_fn is not None:
+            last_prompt = prompt_fn().split("\n")[-1]
         rendered = display_text()
-        sys.stdout.write("\r\033[K" + last_prompt + rendered)
+        if repaint_header and header_fn is not None:
+            cols = max(1, term_cols())
+            hrows = header_rows(cols) or 1
+            header = header_fn()
+            sys.stdout.write(f"\r\033[{hrows}A\033[J")
+            sys.stdout.write(header + "\n")
+            sys.stdout.write("\r\033[2K" + last_prompt + rendered)
+            header_lines_vis = [clean_len(line) for line in header.split("\n")]
+        else:
+            sys.stdout.write("\r\033[2K" + last_prompt + rendered)
         move_left = display_len(units[cursor:])
         if move_left > 0:
             sys.stdout.write(f"\033[{move_left}D")
@@ -296,6 +341,7 @@ def styled_input(prompt, default=None):
         sys.stdout.write(raw_text(prompt) + display_text())
         sys.stdout.flush()
         while True:
+            wait_for_key_or_resize(fd, lambda: redraw(repaint_header=True))
             key = read_key()
             if key == "\x1b[200~":
                 insert_paste(read_bracketed_paste(fd))
@@ -382,16 +428,23 @@ def interactive_menu(title, options, style=Colors.VIOLET):
     entries = options + [f"{Colors.GRAY}0. Cancel{Colors.RESET}"]
     selected = 0
     offset = 0
-    height = 0
+    last_lines = []
+
+    def phys_rows(lines):
+        cols = max(1, term_cols())
+        total = 0
+        for line in lines:
+            vis = clean_len(line)
+            total += ((vis - 1) // cols + 1) if vis > 0 else 1
+        return total
 
     def clear_menu():
-        nonlocal height
-        if not height:
+        nonlocal last_lines
+        if not last_lines:
             return
-        sys.stdout.write(f"\033[{height}F")
-        sys.stdout.write(f"\033[{height}M")
+        sys.stdout.write(f"\033[{phys_rows(last_lines)}F\033[J")
         sys.stdout.flush()
-        height = 0
+        last_lines = []
 
     def finish(value):
         clear_menu()
@@ -400,9 +453,9 @@ def interactive_menu(title, options, style=Colors.VIOLET):
         return value
 
     def draw():
-        nonlocal height, offset
-        if height:
-            sys.stdout.write(f"\033[{height}F")
+        nonlocal last_lines, offset
+        if last_lines:
+            sys.stdout.write(f"\033[{phys_rows(last_lines)}F\033[J")
         try:
             visible_limit = max(6, min(16, os.get_terminal_size().lines - 8))
         except OSError:
@@ -412,9 +465,8 @@ def interactive_menu(title, options, style=Colors.VIOLET):
         elif selected >= offset + visible_limit:
             offset = selected - visible_limit + 1
         lines = menu_lines(title, entries, selected, style, offset, visible_limit)
-        for line in lines:
-            sys.stdout.write("\033[K" + line + "\r\n")
-        height = len(lines)
+        sys.stdout.write("\r" + "\r\n".join(lines) + "\r\n")
+        last_lines = lines
         sys.stdout.flush()
 
     try:
@@ -422,6 +474,7 @@ def interactive_menu(title, options, style=Colors.VIOLET):
         sys.stdout.write("\033[?25l")
         draw()
         while True:
+            wait_for_key_or_resize(fd, draw)
             key = read_key()
             if key in ["\x03", "\x04"]:
                 raise KeyboardInterrupt
@@ -546,6 +599,9 @@ class Spinner:
     def _spin(self):
         i = 0
         self.started_at = time.time()
+        phrase = pick_logo_phrase()
+        two_line = phrase is not None
+        phrase_hold = 50
         while self.running:
             elapsed = time.time() - self.started_at
             frame = self.frames[i % len(self.frames)]
@@ -560,12 +616,23 @@ class Spinner:
                 f"{Colors.WHITE}{self.msg}{Colors.RESET}  "
                 f"{Colors.DIM}{Colors.GRAY}{pulse} · {elapsed:04.1f}s{Colors.RESET}"
             )
-            pad = " " * max(0, self.last_len - clean_len(line))
-            print(line + pad, end="\r")
+            if two_line:
+                if i and i % phrase_hold == 0:
+                    phrase = pick_logo_phrase()
+                avail = max(8, term_cols() - LEFT_MARGIN - 2)
+                ptext = phrase if len(phrase) <= avail else phrase[:avail - 1] + "…"
+                phrase_line = f"{left_indent()}{Colors.DIM}{Colors.ITALIC}{ACCENT}{ptext}{Colors.RESET}"
+                sys.stdout.write("\r\033[2K" + line + "\n\033[2K" + phrase_line + "\033[1A\r")
+            else:
+                sys.stdout.write("\r\033[2K" + line)
+            sys.stdout.flush()
             self.last_len = clean_len(line)
             time.sleep(0.08)
             i += 1
-        sys.stdout.write("\r" + " " * (self.last_len + 2) + "\r")
+        if two_line:
+            sys.stdout.write("\r\033[2K\n\033[2K\033[1A\r")
+        else:
+            sys.stdout.write("\r\033[2K")
         sys.stdout.flush()
 
     def start(self):
@@ -639,7 +706,46 @@ def print_diff(diff_lines):
             print(f"{indent}  {Colors.GRAY}{stripped}{Colors.RESET}")
     print(f"{indent}{frame_bottom(Colors.MAGENTA)}\n")
 
-def print_logo():
+LOGO_PHRASES = [
+    "'Im, invinicble' - Mark Grayson",
+    "-Code like a gallivan",
+    "-Powered by ollama and local AI models",
+    "'Stand ready for my arrival, worm.' - Concquest",
+    " 'MORE BATTLE, MORE GLORY, MORE WORTHY OPPONENTS!' - Battle Beast",
+    "'I am Thragg the Regent of the Viltrum empire.'", 
+    "“ From this point forward we shall only be using our weapons to fight. No more tricks, understand that? ” - Dravik, The Rat King (BTW SHOUTOUT TO DEEPWOKEN)",
+    "Code is poetry, and poetry is for everyone.",
+    "“ Ah, the vainglorious folly... I shall make this agony everlasting. ” - True Heart of Enmity",
+    "“ So it seems honour comes to reclaim its lost child. You fools simply misunderstand - I have found a power far greater than your impotent little Vow. ” - Zi'eer, the Fourth Prophet",
+    "'Oh my god its albert einstein' - Some random dude",
+    "“ …Your movements lack discipline. ” - Maestro Evengarde Rest ",
+    "“ITS COMMON BALL“",
+    "I... eat... your... sandwiches! I eat 'em up!",
+    "'I found you, faker!','Faker? You aren't even good enough to be my fake!'",
+    "'If life gives you lemons, make lemonade.'",
+    "'Some protein tubes... with that white sauce'",
+    "“ I am a Krulian, and one of the few known to you surface-folk. We are the closest bridge between the Gods below and your kind. The next step in the evolutionary chain you could say... But I really must be off, it was a pleasure dancing with you as always. ” ― The Ferryman"
+    "'Im sorry for not being creative enough to come up with more phrases' - mont127",
+    "'The only way to do great work is to love what you do.' - Steve Jobs",
+    "'Code is like humor. When you have to explain it, its bad.' - Cory House",
+    "'Shout out to realmaitreal (Or hafliss) for helping with macndcheese'",
+    "'Its better to say something then just to stay silent' - I heard that somewhere dunno where",
+    "If AI is your power, then what are you without it?"
+    "*Some random cool line from a show i watched*",
+    "'Sometimes I dream of saving the world, saving everyone from the invisible hand' - Elliot Alderson",
+    "'Are you the strongest because you are Satoru Gojo or are you Satoru Gojo because you are the strongest?' - Geto Suguru",
+    "'Stand users attract each other same goes for lonely people' ",
+    "'The world is not beautiful, therefore it is.' - Kino's Journey",
+    "'You cant like the sky without seeing the clouds' ",
+    "'The world is full of nice people. If you can't find one, be one.' - Nishimiya Shouko",
+    "'AI slop? As long as it makes the code Im fine with it.'",
+    "'Cool quote'",
+]
+
+def pick_logo_phrase():
+    return random.choice(LOGO_PHRASES) if LOGO_PHRASES else None
+
+def logo_lines(phrase=None):
     art_lines = [
         " ██████╗  █████╗ ██╗     ██╗     ██╗██╗   ██╗██╗██╗   ██╗███╗   ███╗",
         "██╔════╝ ██╔══██╗██║     ██║     ██║██║   ██║██║██║   ██║████╗ ████║",
@@ -654,12 +760,20 @@ def print_logo():
     art_pad = " " * max(0, (cols - art_width) // 2)
     tagline = "Gallivium · AI coding assistant for the terminal"
     sub = "local models  ·  shell  ·  files  ·  web  ·  autonomous coding"
-    print()
+    out = [""]
     for line in art_lines:
-        print(f"{art_pad}{Colors.WHITE}{Colors.BOLD}{line}{Colors.RESET}")
-    print()
-    print(f"{' ' * max(0, (cols - len(tagline)) // 2)}{Colors.DIM}{Colors.GRAY}{tagline}{Colors.RESET}")
-    print(f"{' ' * max(0, (cols - len(sub)) // 2)}{Colors.DIM}{Colors.GRAY}{sub}{Colors.RESET}")
+        out.append(f"{art_pad}{Colors.WHITE}{Colors.BOLD}{line}{Colors.RESET}")
+    if phrase:
+        out.append("")
+        out.append(f"{' ' * max(0, (cols - clean_len(phrase)) // 2)}{Colors.DIM}{Colors.ITALIC}{ACCENT}{phrase}{Colors.RESET}")
+    out.append("")
+    out.append(f"{' ' * max(0, (cols - len(tagline)) // 2)}{Colors.DIM}{Colors.GRAY}{tagline}{Colors.RESET}")
+    out.append(f"{' ' * max(0, (cols - len(sub)) // 2)}{Colors.DIM}{Colors.GRAY}{sub}{Colors.RESET}")
+    return out
+
+def print_logo(phrase=None):
+    for line in logo_lines(phrase):
+        print(line)
     print()
 
 MAX_OUTPUT_LENGTH = 10000
@@ -671,6 +785,42 @@ COMPACT_TOKEN_BUDGET = 16000
 COMPACT_RECENT_TOOL_CHARS = 4000
 COMPACT_RECENT_TEXT_CHARS = 8000
 COMPACT_SUMMARY_MAX_TOKENS = 700
+SESSIONS_DIR = os.path.expanduser("~/.ocli/sessions")
+SESSION_FORMAT_VERSION = 1
+
+def ensure_sessions_dir():
+    try:
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+    except OSError:
+        pass
+    return SESSIONS_DIR
+
+def resolve_session_path(name):
+    name = name.strip()
+    if os.sep in name or (os.altsep and os.altsep in name) or name.startswith("~"):
+        return os.path.expanduser(name)
+    if not name.endswith(".json"):
+        name += ".json"
+    return os.path.join(ensure_sessions_dir(), name)
+
+def list_saved_sessions():
+    ensure_sessions_dir()
+    items = []
+    try:
+        names = os.listdir(SESSIONS_DIR)
+    except OSError:
+        return items
+    for filename in names:
+        if not filename.endswith(".json"):
+            continue
+        full = os.path.join(SESSIONS_DIR, filename)
+        try:
+            stat = os.stat(full)
+        except OSError:
+            continue
+        items.append({"name": filename, "path": full, "mtime": stat.st_mtime, "size": stat.st_size})
+    items.sort(key=lambda item: item["mtime"], reverse=True)
+    return items
 
 def estimate_tokens(text):
     return max(1, len(str(text or "")) // 4)
@@ -1142,7 +1292,7 @@ class OCLI:
         self.tool_access = "full"
         self.allow_spawn_agents = True
         self.non_interactive = False
-        self.PLAN_PROMPT = "Planning is ENABLED. Before performing complex tasks, multiple file edits, or potentially destructive operations, you MUST create an implementation plan using the 'create_plan' tool. Break the plan down into discrete, numbered tasks that cover every explicit user requirement. As you work, use the 'update_task' tool to mark tasks as 'doing' and 'done'. After the plan is approved, continue by making real tool calls."
+        self.PLAN_PROMPT = "Planning is ENABLED. For any task needing multiple file edits, several steps, or risky operations, you MUST first call 'create_plan' with a numbered list of discrete, verifiable steps covering every explicit user requirement; keep each step a single concrete action. Do not call create_plan for trivial one-step requests. After the plan is approved, immediately mark exactly one task 'doing' with 'update_task' before working on it, then mark it 'done' the moment it is finished and move the next task to 'doing'. Keep only one task 'doing' at a time. Do not re-plan unless requirements change or the user gives feedback. When every task is 'done', stop calling tools and give the user a concise final summary."
         cur_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.messages = [{
             'role': 'system',
@@ -1744,44 +1894,99 @@ class OCLI:
             return f"File created. Diff shown (+{added} lines)."
         except Exception as e: return f"Error: {str(e)}"
 
+    def _parse_plan_tasks(self, plan):
+        tasks = []
+        seen = set()
+        for line in str(plan).split('\n'):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            match = re.match(r'^[-*]\s*\[[ xX]?\]\s*(.+)$', stripped)
+            if not match:
+                match = re.match(r'^\d+[.)]\s+(.+)$', stripped)
+            if not match:
+                match = re.match(r'^[-*•]\s+(.+)$', stripped)
+            if not match:
+                continue
+            text = re.sub(r'\s+', ' ', match.group(1).strip())
+            key = text.lower()
+            if text and key not in seen:
+                seen.add(key)
+                tasks.append({'text': text, 'status': 'todo'})
+        if not tasks:
+            for line in str(plan).split('\n'):
+                text = re.sub(r'\s+', ' ', line.strip())
+                if text and text.lower() not in seen:
+                    seen.add(text.lower())
+                    tasks.append({'text': text, 'status': 'todo'})
+        return tasks
+
     def print_tasks(self):
         if not self.tasks: return
-        print(f"\n  {frame_title('PROGRESS CHECKPOINTS', Colors.TEAL)}")
+        indent = left_indent()
+        total = len(self.tasks)
+        done = sum(1 for task in self.tasks if task['status'] == 'done')
+        doing = sum(1 for task in self.tasks if task['status'] == 'doing')
+        pct = int(round(done * 100 / total)) if total else 0
+        slots = 16
+        filled = int(round(done * slots / total)) if total else 0
+        bar = f"{Colors.GREEN}{'━' * filled}{Colors.DIM}{Colors.GRAY}{'━' * (slots - filled)}{Colors.RESET}"
+        print(f"\n{indent}{frame_title('PLAN PROGRESS', Colors.TEAL, subtitle=f'{done}/{total} done · {pct}%')}")
+        print(f"{indent}  {bar}  {Colors.WHITE}{Colors.BOLD}{pct}%{Colors.RESET} {Colors.DIM}{Colors.GRAY}({done} done · {doing} active · {total - done - doing} todo){Colors.RESET}")
         for i, task in enumerate(self.tasks):
-            icon = f"{Colors.GRAY}○"
-            if task['status'] == 'done': icon = f"{Colors.GREEN}✓"
-            elif task['status'] == 'doing': icon = f"{Colors.ORANGE}◆"
-            print(f"    {icon} {Colors.RESET}{i+1}. {task['text']}")
-        print(f"  {frame_bottom(Colors.TEAL)}\n")
+            status = task['status']
+            if status == 'done':
+                icon = f"{Colors.GREEN}{Colors.BOLD}✓{Colors.RESET}"
+                text = f"{Colors.DIM}{Colors.GRAY}{task['text']}{Colors.RESET}"
+            elif status == 'doing':
+                icon = f"{Colors.AMBER}{Colors.BOLD}▶{Colors.RESET}"
+                text = f"{Colors.WHITE}{Colors.BOLD}{task['text']}{Colors.RESET}"
+            else:
+                icon = f"{Colors.DIM}{Colors.GRAY}○{Colors.RESET}"
+                text = f"{Colors.SLATE}{task['text']}{Colors.RESET}"
+            number = f"{Colors.DIM}{Colors.GRAY}{i + 1:>2}.{Colors.RESET}"
+            print(f"{indent}  {icon} {number} {text}")
+        print(f"{indent}{frame_bottom(Colors.TEAL)}\n")
 
     def create_plan(self, plan):
         try:
-            self.tasks = []
-            lines = plan.split('\n')
-            for line in lines:
-                match = re.match(r'^\s*[\*\-\d\.]+\s*(.*)', line)
-                if match and match.group(1).strip():
-                    self.tasks.append({'text': match.group(1).strip(), 'status': 'todo'})
-            
-            print(f"\n  {frame_title('IMPLEMENTATION PLAN', Colors.GREEN)}")
+            self.tasks = self._parse_plan_tasks(plan)
+            indent = left_indent()
+            print(f"\n{indent}{frame_title('IMPLEMENTATION PLAN', Colors.GREEN, subtitle=f'{len(self.tasks)} steps')}")
             print(render_text(plan))
-            print(f"  {frame_bottom(Colors.GREEN)}")
+            print(f"{indent}{frame_bottom(Colors.GREEN)}")
             self.print_tasks()
-            print(f"  {Colors.YELLOW}{Colors.BOLD}Awaiting your approval or feedback to proceed...{Colors.RESET}")
-            feedback = styled_input(f"  {Colors.BOLD}Feedback (Enter to approve):{Colors.RESET} ").strip()
+            print(f"{indent}{Colors.AMBER}{Colors.BOLD}▸ Review the plan{Colors.RESET} {Colors.DIM}{Colors.GRAY}— press Enter to approve, or type changes to revise.{Colors.RESET}")
+            feedback = styled_input(f"{indent}{ACCENT}{Colors.BOLD}❯{Colors.RESET} ").strip()
             if not feedback:
-                return "Plan approved. Start by marking the first task as 'doing' using update_task."
-            return f"User feedback: {feedback}. Adjust the plan or address it."
+                log_ok(f"Plan approved · {len(self.tasks)} steps")
+                return "Plan approved. Mark the first task 'doing' with update_task, then make real tool calls. Mark each task 'done' as you finish it."
+            log_info("Plan revision requested")
+            return f"User feedback on the plan: {feedback}. Revise the plan with create_plan or address the feedback before proceeding."
         except Exception as e: return f"Error: {str(e)}"
 
     def update_task(self, index, status):
         try:
-            idx = int(index) - 1
-            if 0 <= idx < len(self.tasks):
-                self.tasks[idx]['status'] = status
-                self.print_tasks()
-                return f"Task {index} updated to {status}."
-            return f"Invalid task index: {index}"
+            status = str(status).strip().lower()
+            if status not in ('todo', 'doing', 'done'):
+                return f"Invalid status '{status}'. Use one of: todo, doing, done."
+            if not self.tasks:
+                return "No active plan. Call create_plan first."
+            digits = re.sub(r'[^0-9]', '', str(index))
+            if not digits:
+                return f"Invalid task index: {index}"
+            idx = int(digits) - 1
+            if not (0 <= idx < len(self.tasks)):
+                return f"Invalid task index: {index} (plan has {len(self.tasks)} tasks)."
+            self.tasks[idx]['status'] = status
+            self.print_tasks()
+            done = sum(1 for task in self.tasks if task['status'] == 'done')
+            total = len(self.tasks)
+            if done == total:
+                indent = left_indent()
+                print(f"{indent}{Colors.GREEN}{Colors.BOLD}✓ All {total} plan steps complete.{Colors.RESET}\n")
+                return f"Task {idx + 1} marked {status}. All {total} tasks are done — give the user a concise final summary of what changed and how to use it."
+            return f"Task {idx + 1} marked {status}. Progress: {done}/{total} done. Continue with the next task."
         except Exception as e: return f"Error: {str(e)}"
 
     def _spawn_agent_chat(self, agent, shared_context="", timeout_seconds=120, max_steps=3, tool_access="read_only"):
@@ -1952,23 +2157,119 @@ class OCLI:
 
     def save_session(self, path=None):
         try:
-            if not path:
-                path = f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(path, 'w') as f:
-                json.dump(self.messages, f, indent=2)
-            log_info(f"Session saved to {path}")
-            return f"Session saved to {path}"
-        except Exception as e: return f"Error saving session: {str(e)}"
+            if path:
+                target = resolve_session_path(path)
+            else:
+                target = os.path.join(ensure_sessions_dir(), f"session_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+            parent = os.path.dirname(os.path.abspath(target))
+            os.makedirs(parent, exist_ok=True)
+            envelope = {
+                "version": SESSION_FORMAT_VERSION,
+                "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "backend": self.backend,
+                "model": self.model_name,
+                "url": self.url,
+                "auto_mode": self.auto_mode,
+                "planning_enabled": self.planning_enabled,
+                "compaction_count": self.compaction_count,
+                "last_summary": self.last_summary,
+                "tasks": self.tasks,
+                "message_count": len(self.messages),
+                "messages": self.messages,
+            }
+            with open(target, "w") as f:
+                json.dump(envelope, f, indent=2)
+            log_ok(f"Session saved {Colors.DIM}{Colors.GRAY}→{Colors.RESET} {Colors.WHITE}{target}{Colors.RESET} {Colors.DIM}{Colors.GRAY}({len(self.messages)} messages){Colors.RESET}")
+            return f"Session saved to {target}"
+        except Exception as e:
+            log_warn(f"Error saving session: {e}")
+            return f"Error saving session: {str(e)}"
 
-    def load_session(self, path):
+    def session_menu(self):
+        sessions = list_saved_sessions()
+        if not sessions:
+            log_info(f"No saved sessions in {SESSIONS_DIR}")
+            return None
+        labels = []
+        for item in sessions:
+            when = datetime.datetime.fromtimestamp(item["mtime"]).strftime("%Y-%m-%d %H:%M")
+            kb = max(1, round(item["size"] / 1024))
+            labels.append(f"{item['name']}  {Colors.DIM}{Colors.GRAY}{when} · {kb} KB{Colors.RESET}")
+        idx = interactive_menu("load session", labels, Colors.VIOLET)
+        if idx is None:
+            return None
+        return sessions[idx]["path"]
+
+    def load_session(self, path=None):
         try:
-            if not os.path.exists(path):
-                return f"File not found: {path}"
-            with open(path, 'r') as f:
-                self.messages = json.load(f)
-            log_info(f"Session loaded from {path}")
-            return f"Session loaded from {path}"
-        except Exception as e: return f"Error loading session: {str(e)}"
+            if path:
+                target = resolve_session_path(path)
+                if not os.path.exists(target) and os.path.exists(path):
+                    target = path
+            else:
+                target = self.session_menu()
+                if not target:
+                    return "Load canceled."
+            if not os.path.exists(target):
+                log_warn(f"Session not found: {target}")
+                return f"File not found: {target}"
+            with open(target, "r") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                messages, meta = data, {}
+            elif isinstance(data, dict) and isinstance(data.get("messages"), list):
+                messages, meta = data["messages"], data
+            else:
+                log_warn("Unrecognized session file format.")
+                return "Unrecognized session format."
+            if not messages or not isinstance(messages[0], dict):
+                log_warn("Session file contains no usable messages.")
+                return "Session file contains no usable messages."
+            self.messages = messages
+            restored = []
+            if meta.get("model"):
+                self.model_name = meta["model"]
+                restored.append("model")
+            if meta.get("backend") and meta["backend"] != self.backend:
+                self.backend = meta["backend"]
+                self.server_model = None
+                restored.append("backend")
+            if meta.get("url"):
+                self.url = meta["url"]
+            if "auto_mode" in meta:
+                self.auto_mode = bool(meta["auto_mode"])
+                restored.append("auto")
+            if "planning_enabled" in meta:
+                self.planning_enabled = bool(meta["planning_enabled"])
+                restored.append("planning")
+            if isinstance(meta.get("compaction_count"), int):
+                self.compaction_count = meta["compaction_count"]
+            if "last_summary" in meta:
+                self.last_summary = meta["last_summary"] or ""
+            if isinstance(meta.get("tasks"), list):
+                self.tasks = meta["tasks"]
+            log_ok(f"Session loaded {Colors.DIM}{Colors.GRAY}←{Colors.RESET} {Colors.WHITE}{target}{Colors.RESET} {Colors.DIM}{Colors.GRAY}({len(self.messages)} messages){Colors.RESET}")
+            if restored:
+                log_info(f"Restored {', '.join(restored)} {Colors.DIM}{Colors.GRAY}·{Colors.RESET} {Colors.WHITE}{self.backend}:{self.model_name}{Colors.RESET}")
+            return f"Session loaded from {target}"
+        except json.JSONDecodeError as e:
+            log_warn(f"Session file is not valid JSON: {e}")
+            return f"Invalid session file: {e}"
+        except Exception as e:
+            log_warn(f"Error loading session: {e}")
+            return f"Error loading session: {str(e)}"
+
+    def print_sessions(self):
+        sessions = list_saved_sessions()
+        if not sessions:
+            log_info(f"No saved sessions in {SESSIONS_DIR}")
+            return
+        rows = [f"{Colors.DIM}{Colors.GRAY}{SESSIONS_DIR}{Colors.RESET}", ""]
+        for item in sessions:
+            when = datetime.datetime.fromtimestamp(item["mtime"]).strftime("%Y-%m-%d %H:%M")
+            kb = max(1, round(item["size"] / 1024))
+            rows.append(f"{Colors.WHITE}{item['name']}{Colors.RESET}  {Colors.DIM}{Colors.GRAY}{when} · {kb} KB{Colors.RESET}")
+        print_panel("sessions", rows, MUTED)
 
     def display_metrics(self, response):
         if self.backend == 'ollama':
@@ -2144,7 +2445,7 @@ class OCLI:
         return prepared
 
     def run(self):
-        print_logo()
+        print_logo(pick_logo_phrase())
         print_panel("session", [
             kv_row("model",   f"{Colors.WHITE}{self.model_name}{Colors.RESET}"),
             kv_row("backend", f"{Colors.WHITE}{self.backend}{Colors.RESET}"),
@@ -2154,25 +2455,29 @@ class OCLI:
         ], MUTED)
         while True:
             try:
-                width = term_width()
-                inner = width - 2
-                indent = left_indent()
-                meta_left = f" OCLI "
-                meta_right = f" {self.backend}:{self.model_name} · auto {'on' if self.auto_mode else 'off'} · plan {'on' if self.planning_enabled else 'off'} "
-                fill = max(2, inner - len(meta_left) - len(meta_right))
-                top = (
-                    f"{indent}{MUTED}╭─{Colors.RESET}"
-                    f"{ACCENT}{Colors.BOLD}{meta_left}{Colors.RESET}"
-                    f"{MUTED}{'─' * fill}{Colors.RESET}"
-                    f"{Colors.DIM}{Colors.GRAY}{meta_right}{Colors.RESET}"
-                    f"{MUTED}─╮{Colors.RESET}"
-                )
-                bottom = f"{indent}{MUTED}╰{'─' * (width - 2)}╯{Colors.RESET}"
+                def render_top():
+                    width = term_width()
+                    indent = left_indent()
+                    meta_left = f" OCLI "
+                    meta_right = f" {self.backend}:{self.model_name} · auto {'on' if self.auto_mode else 'off'} · plan {'on' if self.planning_enabled else 'off'} "
+                    fill = width - 4 - len(meta_left) - len(meta_right)
+                    if fill < 2:
+                        budget = max(0, width - 4 - len(meta_left) - 2)
+                        meta_right = meta_right[:budget]
+                        fill = max(2, width - 4 - len(meta_left) - len(meta_right))
+                    return (
+                        f"{indent}{MUTED}╭─{Colors.RESET}"
+                        f"{ACCENT}{Colors.BOLD}{meta_left}{Colors.RESET}"
+                        f"{MUTED}{'─' * fill}{Colors.RESET}"
+                        f"{Colors.DIM}{Colors.GRAY}{meta_right}{Colors.RESET}"
+                        f"{MUTED}─╮{Colors.RESET}"
+                    )
+                def render_prompt():
+                    return f"{left_indent()}{MUTED}│{Colors.RESET} {ACCENT}{Colors.BOLD}❯{Colors.RESET} "
                 print()
-                print(top)
-                prompt_inline = f"{indent}{MUTED}│{Colors.RESET} {ACCENT}{Colors.BOLD}❯{Colors.RESET} "
-                user_input = styled_input(prompt_inline).strip()
-                print(bottom)
+                print(render_top())
+                user_input = styled_input(render_prompt(), header_fn=render_top, prompt_fn=render_prompt).strip()
+                print(f"{left_indent()}{MUTED}╰{'─' * (term_width() - 2)}╯{Colors.RESET}")
                 print("")
                 print(soft_rule(Colors.VIOLET))
                 if not user_input: continue
@@ -2196,14 +2501,15 @@ class OCLI:
                             self.messages[0]['content'] = self.messages[0]['content'].replace(self.PLAN_PROMPT, "Planning is DISABLED. Do not use create_plan tool unless planning is explicitly enabled.")
                         continue
                     elif cmd == '/save':
-                        path = cmd_parts[1] if len(cmd_parts) > 1 else None
+                        path = " ".join(cmd_parts[1:]) if len(cmd_parts) > 1 else None
                         self.save_session(path)
                         continue
                     elif cmd == '/load':
-                        if len(cmd_parts) < 2:
-                            log_info("Usage: /load <filename>")
-                            continue
-                        self.load_session(cmd_parts[1])
+                        path = " ".join(cmd_parts[1:]) if len(cmd_parts) > 1 else None
+                        self.load_session(path)
+                        continue
+                    elif cmd == '/sessions':
+                        self.print_sessions()
                         continue
                     elif cmd == '/status':
                         print_panel("status", [
@@ -2240,6 +2546,14 @@ class OCLI:
                     elif cmd == '/tasks':
                         self.print_tasks()
                         continue
+                    elif cmd == '/phrase':
+                        if LOGO_PHRASES:
+                            phrase = random.choice(LOGO_PHRASES)
+                            cols = term_cols()
+                            print(f"\n{' ' * max(0, (cols - clean_len(phrase)) // 2)}{Colors.DIM}{Colors.ITALIC}{ACCENT}{phrase}{Colors.RESET}\n")
+                        else:
+                            log_info("No phrases are configured.")
+                        continue
                     elif cmd == '/help':
                         def help_row(cmd_text, desc):
                             pad = max(0, 34 - clean_len(cmd_text))
@@ -2250,8 +2564,9 @@ class OCLI:
                             help_header("session"),
                             help_row("/status",                          "show model and backend status"),
                             help_row("/tasks",                           "show progress checkpoints"),
-                            help_row("/save [file]",                     "save current session to JSON"),
-                            help_row("/load <file>",                     "load a session from JSON"),
+                            help_row("/save [name]",                     "save session (auto-named if omitted)"),
+                            help_row("/load [name]",                     "load a session (menu if omitted)"),
+                            help_row("/sessions",                        "list saved sessions"),
                             help_row("/exit",                            "quit OCLI"),
                             "",
                             help_header("models & backends"),
@@ -2264,6 +2579,7 @@ class OCLI:
                             help_header("behavior"),
                             help_row("/auto",                            "toggle auto-execution mode"),
                             help_row("/plan",                            "toggle autonomous planning mode"),
+                            help_row("/phrase",                          "show a random phrase"),
                             help_row("/help",                            "show this command list"),
                         ], MUTED)
                         continue
@@ -2351,8 +2667,8 @@ class OCLI:
                     spawn_agents_tool_schema(),
                 ]
                 if self.planning_enabled:
-                    tools.append({'type': 'function', 'function': {'name': 'create_plan', 'description': 'Create an implementation plan before performing complex tasks.', 'parameters': {'type': 'object', 'properties': {'plan': {'type': 'string'}}, 'required': ['plan']}}})
-                    tools.append({'type': 'function', 'function': {'name': 'update_task', 'description': 'Update the status of a task in the current plan.', 'parameters': {'type': 'object', 'properties': {'index': {'type': 'string', 'description': 'The 1-based index of the task'}, 'status': {'type': 'string', 'enum': ['todo', 'doing', 'done']}}, 'required': ['index', 'status']}}})
+                    tools.append({'type': 'function', 'function': {'name': 'create_plan', 'description': 'Create an implementation plan before a multi-step task. Provide a numbered or bulleted list where each line is one discrete, verifiable step.', 'parameters': {'type': 'object', 'properties': {'plan': {'type': 'string', 'description': 'A numbered or bulleted list of discrete steps, one per line.'}}, 'required': ['plan']}}})
+                    tools.append({'type': 'function', 'function': {'name': 'update_task', 'description': "Update a plan task's status. Mark exactly one task 'doing' before working it, then 'done' when finished.", 'parameters': {'type': 'object', 'properties': {'index': {'type': 'string', 'description': 'The 1-based index of the task'}, 'status': {'type': 'string', 'enum': ['todo', 'doing', 'done']}}, 'required': ['index', 'status']}}})
                 if self.tool_access == "read_only" or not self.allow_spawn_agents:
                     tools = [tool for tool in tools if tool.get('function', {}).get('name') in available_tools]
 
